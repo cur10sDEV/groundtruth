@@ -143,7 +143,9 @@ Two Python runtimes: **API server** (read path) and **ingestion worker** (write 
 ```
 POST /query
   1. validate (pydantic) → auth/RBAC → rate-limit (Redis) → token budget
-  2. guardrails (prompt-injection, PII, profanity)          [span]
+  2. guardrails: prompt-injection + profanity block; PII detected and
+     MASKED on input; input cleaned (delimiter/template neutralization);
+     optional feature-flagged dedicated guard model (rail-indicator gate) [span]
   3. semantic-cache lookup (org-scoped); serve on hit       [span]
   4. LLM query rewrite → verbose/normalized + K multi-queries [span]
   5. LLM metadata-filter extraction (tool call / structured
@@ -151,13 +153,16 @@ POST /query
   6. hybrid search (dense + sparse in parallel) with
      payload filters = RBAC scope ∧ extracted filters        [span]
   7. RRF fusion → **optional cloud reranker (feature-flag-gated)**, e.g., Cohere Rerank [span]
-  8. context assembly (parent chunks) → LLM generation
+  8. context assembly (parent chunks) truncated to a
+     CONFIGURABLE context token budget → LLM generation
      (LiteLLM primary → fallback cloud model), SSE stream + sliding-window
-     validation checkpoint                                   [span]
+     validation checkpoint; surfaces `model_used`             [span]
   9. faithfulness check (LLM-as-judge)                      [span]
- 10. cache original query + answer + cited chunk/doc IDs +
+ 10. output security validation: mask any PII in the answer, scan for
+     secret/harmful patterns                                [span]
+ 11. cache original query + answer + cited chunk/doc IDs +
      faithfulness result                                     [span]
- 11. record trace/metrics; return answer + citations
+ 12. record trace/metrics; return answer + citations
 ```
 
 ### Metadata-filter extraction (step 5)
@@ -194,8 +199,19 @@ POST /query
 - JWT auth; org membership + role determines retrieval and cache scope.
 - RBAC payload filters on every Qdrant query; PG queries scoped by user/org.
 - Semantic cache scoped by org (never served across orgs).
-- Rate limiting, input/output validation, file-size limits (S3 + frontend), prompt-injection/PII/
-  profanity guardrails.
+- Rate limiting, input/output validation, file-size limits (S3 + frontend).
+- **Input guardrails:** prompt-injection + profanity block the query; PII (email, phone, SSN,
+  **credit card**) is detected and **masked** (not just blocked) before the query reaches the LLM;
+  input is **cleaned** to neutralize prompt-boundary/template markers (`---`, `===`, `{{ }}`).
+- **Output security validation:** after generation and before returning to the client, the answer is
+  scanned for PII leakage (masked in place) and for secret (`password is`, `api_key:`) / harmful
+  patterns (blocked). Complements the faithfulness check (grounding).
+- **Optional dedicated guard model** behind a feature flag (`guard_model.enabled`): a low-cost cloud
+  model (temperature 0) classifies jailbreak/off-topic intent; a **rail indicator** substring match
+  (not output JSON shape) determines whether the rail fired.
+- **Configurable context budget:** assembled retrieval context is truncated to a configurable
+  `max_context_tokens` before generation to respect model window limits.
+- `model_used` (primary/fallback/guard) surfaced in the response and traces for debugging.
 
 ## 9. Error Handling & Failure Modes
 
@@ -211,10 +227,13 @@ POST /query
 
 ## 10. Testing & Evaluation
 
-- **Unit:** chunkers, retriever, filter extraction, guardrails, cache, auth/RBAC.
+- **Unit:** chunkers, retriever, filter extraction, guardrails (incl. PII masking + output
+  validation, deterministic/no-LLM), cache, auth/RBAC.
 - **Integration:** docker-compose services end-to-end (upload → ingest → query → cite).
 - **Eval harness** (`eval/`): seed QA set; metrics = retrieval recall, MRR, context precision,
   answer faithfulness, answer relevance.
+- **Guardrail eval:** labeled positives + negatives run against the live API, classified
+  TP/TN/FP/FN → precision, recall, accuracy (catches false positives too).
 - **Red-team script:** prompt-injection, information-leak, bias/harmful-output smoke checks.
 
 ## 11. Defaults (set unless changed)
@@ -222,5 +241,7 @@ POST /query
   API key required when enabled.
 - Model routing: one primary cloud model + one fallback cloud model via LiteLLM (e.g., primary
   OpenAI GPT-4o → fallback Anthropic Claude, both keyed).
+- Context budget: configurable `max_context_tokens` (default 4000) caps assembled retrieval context
+  before generation.
 - Tooling: ruff (lint), pytest (tests), monorepo layout above.
 - Filter allow-list defined centrally and extendable via config.

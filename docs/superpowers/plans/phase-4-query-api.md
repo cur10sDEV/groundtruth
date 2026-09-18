@@ -364,9 +364,13 @@ git commit -m "feat(rag): add org-scoped semantic cache with reverse index"
 
 **Interfaces:**
 - Produces:
-  - `async generate_answer(contexts: list[dict], query: str) -> AsyncIterator[str]` in `generate.py`
-    — streams tokens from LiteLLM `acompletion(stream=True)` using the primary model with a prompt
-    requiring citations `[n]` and grounding in context; yields text chunks.
+  - `async generate_answer(contexts: list[dict], query: str) -> AsyncIterator[dict]` in `generate.py`
+    — streams from LiteLLM `acompletion(stream=True)` using the primary model with a prompt requiring
+    citations `[n]` and grounding in context. Yields `{"type":"meta","model_used":<model>}` first,
+    then `{"type":"token","text":...}` for each streamed token. `model_used` is read from the first
+    streamed chunk's `.model` so it reflects the actually-serving (primary or fallback) model.
+  - `truncate_contexts(contexts: list[dict], max_tokens: int) -> list[dict]` — greedily keeps contexts
+    until the token budget is reached (rough token estimate = chars/4).
   - `@dataclass FaithfulnessResult`: `faithful: bool`, `score: float`.
   - `async check_faithfulness(query: str, answer: str, contexts: list[dict]) -> FaithfulnessResult`
     in `faithfulness.py` — LLM-as-judge scores 0..1 groundedness; `faithful = score >= 0.7`.
@@ -376,7 +380,7 @@ git commit -m "feat(rag): add org-scoped semantic cache with reverse index"
 
 `backend/tests/test_generate.py`:
 ```python
-from app.rag.retrieval.generate import build_context_block
+from app.rag.retrieval.generate import build_context_block, truncate_contexts
 from app.rag.retrieval.faithfulness import FaithfulnessResult
 
 
@@ -384,6 +388,13 @@ def test_build_context_block_numbers_citations():
     block = build_context_block([{"text": "Alpha"}, {"text": "Beta"}])
     assert "[1]" in block and "[2]" in block
     assert "Alpha" in block and "Beta" in block
+
+
+def test_truncate_contexts_respects_budget():
+    ctx = [{"text": "x" * 40}, {"text": "y" * 40}]
+    out = truncate_contexts(ctx, max_tokens=8)
+    # 40 chars ~ 10 tokens each; budget 8 fits only the first
+    assert len(out) == 1
 
 
 def test_faithfulness_dataclass():
@@ -411,7 +422,19 @@ def build_context_block(contexts: list[dict]) -> str:
     return "\n\n".join(f"[{i + 1}] {c['text']}" for i, c in enumerate(contexts))
 
 
-async def generate_answer(contexts: list[dict], query: str) -> AsyncIterator[str]:
+def truncate_contexts(contexts: list[dict], max_tokens: int) -> list[dict]:
+    budget = max_tokens
+    out: list[dict] = []
+    for c in contexts:
+        tokens = len(c["text"]) // 4 + 1
+        if tokens > budget:
+            break
+        budget -= tokens
+        out.append(c)
+    return out
+
+
+async def generate_answer(contexts: list[dict], query: str) -> AsyncIterator[dict]:
     s = get_settings()
     system = (
         "You are a grounded question-answering assistant. Answer ONLY using the provided "
@@ -431,10 +454,18 @@ async def generate_answer(contexts: list[dict], query: str) -> AsyncIterator[str
         max_tokens=s.max_output_tokens,
         stream=True,
     )
+    model_used = s.llm_primary_model
+    first = True
     async for chunk in resp:
+        if first and getattr(chunk, "model", None):
+            model_used = chunk.model
+            yield {"type": "meta", "model_used": model_used}
+            first = False
         delta = chunk.choices[0].delta.content if chunk.choices else None
         if delta:
-            yield delta
+            yield {"type": "token", "text": delta}
+    if first:
+        yield {"type": "meta", "model_used": model_used}
 ```
 
 `backend/app/rag/retrieval/faithfulness.py`:
@@ -508,17 +539,21 @@ git commit -m "feat(rag): add grounded generation with citations and faithfulnes
 
 **Interfaces:**
 - Produces:
-  - `async run_query(query: str, org_id: str, user_ids: list[str],
+- `async run_query(query: str, org_id: str, user_ids: list[str],
     feature_flags: dict, trace_id: str) -> AsyncIterator[dict]` in `orchestrator.py` — yields SSE
     events in order:
-    1. `{"type":"status","stage":"guardrails","ok":bool}`
+    1. `{"type":"status","stage":"guardrails","ok":bool}` (on block, `done` with refusal)
     2. `{"type":"status","stage":"cache","hit":bool}` (ends early on hit with `answer`)
     3. `{"type":"status","stage":"rewrite"}`
     4. `{"type":"status","stage":"filters"}`
     5. `{"type":"status","stage":"retrieve"}`
-    6. `{"type":"token","text":...}` (streamed from generation)
+    6. `{"type":"meta","model_used":...}` + `{"type":"token","text":...}` (streamed)
     7. `{"type":"faithfulness","faithful":bool,"score":float}`
-    8. `{"type":"done","chunk_ids":[...],"doc_ids":[...],"answer":...}`
+    8. `{"type":"output_warning","warnings":[...]}` (if output validation flagged anything)
+    9. `{"type":"done","chunk_ids":[...],"doc_ids":[...],"answer":...}`
+  - `run_query` uses the **cleaned/masked query** (`run_guardrails().cleaned_text`) for downstream
+    stages, **truncates contexts** to `settings.max_context_tokens`, and runs **output validation**
+    (`validate_output`) on the final answer before emitting `done`.
   - `router` in `routes_query.py`:
     - `POST /query` → auth + rate-limit + token-budget + guardrails; streams SSE via
       `StreamingResponse`.
@@ -550,11 +585,12 @@ Expected: FAIL.
 import asyncio
 from collections.abc import AsyncIterator
 
-from app.rag.guardrails.rules import run_guardrails
+from app.core.config import get_settings
+from app.rag.guardrails.rules import run_guardrails, validate_output
 from app.rag.retrieval.cache import get_cached, set_cached
 from app.rag.retrieval.filters import extract_filters
 from app.rag.retrieval.faithfulness import check_faithfulness
-from app.rag.retrieval.generate import generate_answer
+from app.rag.retrieval.generate import generate_answer, truncate_contexts
 from app.rag.retrieval.retriever import get_retriever
 from app.rag.retrieval.rewrite import rewrite_query
 
@@ -562,11 +598,14 @@ from app.rag.retrieval.rewrite import rewrite_query
 async def run_query(
     query: str, org_id: str, user_ids: list[str], feature_flags: dict, trace_id: str
 ) -> AsyncIterator[dict]:
+    settings = get_settings()
     flags = feature_flags
 
-    # guardrails
+    # guardrails: block injection/profanity, mask PII, clean input
     g = run_guardrails(query)
-    yield {"type": "status", "stage": "guardrails", "ok": g.passed, "reasons": g.reasons}
+    cleaned = g.cleaned_text
+    yield {"type": "status", "stage": "guardrails", "ok": g.passed, "reasons": g.reasons,
+           "masked": g.masked}
     if not g.passed:
         yield {"type": "done", "answer": "Query blocked by guardrails.", "chunk_ids": [], "doc_ids": []}
         return
@@ -574,7 +613,7 @@ async def run_query(
     # semantic cache
     cache_on = flags.get("cache.enabled", True)
     if cache_on:
-        cached = await get_cached(org_id, query)
+        cached = await get_cached(org_id, cleaned)
         if cached is not None and cached.faithful:
             yield {"type": "status", "stage": "cache", "hit": True}
             yield {
@@ -586,12 +625,12 @@ async def run_query(
             return
         yield {"type": "status", "stage": "cache", "hit": False}
 
-    # rewrite
-    rewritten = await rewrite_query(query)
+    # rewrite (use cleaned query)
+    rewritten = await rewrite_query(cleaned)
     yield {"type": "status", "stage": "rewrite"}
 
     # filters
-    filters = await extract_filters(query)
+    filters = await extract_filters(cleaned)
     yield {"type": "status", "stage": "filters"}
 
     # retrieve
@@ -609,6 +648,9 @@ async def run_query(
         contexts.append({"id": c.chunk_id, "text": c.payload.get("chunk_text_hash", "")})
         if len(contexts) >= 8:
             break
+
+    # configurable context budget before generation
+    contexts = truncate_contexts(contexts, settings.max_context_tokens)
     yield {"type": "status", "stage": "retrieve", "count": len(contexts)}
 
     if not contexts:
@@ -620,27 +662,37 @@ async def run_query(
         }
         return
 
-    # generate (stream)
+    # generate (stream), capture model_used
     answer_parts = []
-    async for tok in generate_answer(contexts, query):
-        answer_parts.append(tok)
-        yield {"type": "token", "text": tok}
+    model_used = settings.llm_primary_model
+    async for ev in generate_answer(contexts, cleaned):
+        if ev["type"] == "meta":
+            model_used = ev["model_used"]
+            yield {"type": "meta", "model_used": model_used}
+        else:
+            answer_parts.append(ev["text"])
+            yield {"type": "token", "text": ev["text"]}
     answer = "".join(answer_parts)
 
     # faithfulness
     if flags.get("faithfulness.enabled", True):
-        f = await check_faithfulness(query, answer, contexts)
+        f = await check_faithfulness(cleaned, answer, contexts)
         yield {"type": "faithfulness", "faithful": f.faithful, "score": f.score}
         if not f.faithful:
             answer = "I cannot confidently answer that based on the available documents."
             yield {"type": "override", "answer": answer}
+
+    # output security validation (mask PII, scan secret/harmful patterns)
+    answer, warnings = validate_output(answer)
+    if warnings:
+        yield {"type": "output_warning", "warnings": warnings}
 
     chunk_ids = [c["id"] for c in contexts]
     doc_ids = list({c["id"].split(":")[0] for c in contexts})
     if cache_on:
         await set_cached(
             org_id,
-            query,
+            cleaned,
             {
                 "answer": answer,
                 "chunk_ids": chunk_ids,

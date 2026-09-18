@@ -176,6 +176,11 @@ class Settings(BaseSettings):
     # Tokens
     max_input_tokens: int = 8000
     max_output_tokens: int = 2048
+    max_context_tokens: int = 4000
+
+    # Optional dedicated guard model (feature-flagged; empty disables)
+    guard_model: str = ""
+    guard_model_enabled: bool = False
 
 
 @lru_cache
@@ -240,6 +245,9 @@ LLM_FALLBACK_MODEL=anthropic/claude-3-5-sonnet-20241022
 LLM_API_KEY_PRIMARY=
 LLM_API_KEY_FALLBACK=
 EMBED_MODEL=openai/text-embedding-3-small
+MAX_CONTEXT_TOKENS=4000
+GUARD_MODEL=
+GUARD_MODEL_ENABLED=false
 RERANKER_PROVIDER=cohere
 RERANKER_MODEL=rerank-english-v3.0
 RERANKER_API_KEY=
@@ -604,6 +612,7 @@ router = APIRouter(tags=["health"])
 
 @router.get("/health")
 async def health() -> dict:
+    # Readiness checks (DB/Qdrant/Redis/Flagsmith/Langfuse) added in Phase 6
     return {"status": "ok"}
 ```
 
