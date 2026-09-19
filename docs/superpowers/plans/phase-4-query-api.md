@@ -558,7 +558,11 @@ git commit -m "feat(rag): add grounded generation with citations and faithfulnes
     - `POST /query` → auth + rate-limit + token-budget + guardrails; streams SSE via
       `StreamingResponse`.
     - `GET /query/{query_id}/citations` → returns cited chunks (text + offsets) from Postgres.
-  - `resolve_text_for_chunk_ids(chunk_ids: list[str]) -> list[dict]` helper (chunk text from Postgres).
+  - `resolve_text_for_chunk_ids(chunk_ids: list[str], org_id: str) -> list[dict]` helper in
+    `orchestrator.py` — fetches real chunk text from Postgres (`Chunk` rows, filtered to
+    `chunk_id IN (...) AND org_id == org_id`) via the async session factory from Phase 1; returns
+    `[{"id": ..., "text": ...}]`. Qdrant payloads carry only a `chunk_text_hash` placeholder —
+    generation contexts MUST be enriched from Postgres, never from the Qdrant payload.
 
 - [ ] **Step 1: Write the failing orchestrator test**
 
@@ -585,14 +589,43 @@ Expected: FAIL.
 import asyncio
 from collections.abc import AsyncIterator
 
+from sqlalchemy import select
+
 from app.core.config import get_settings
+from app.db import get_sessionmaker
+from app.models.chunk import Chunk
 from app.rag.guardrails.rules import run_guardrails, validate_output
-from app.rag.retrieval.cache import get_cached, set_cached
+from app.rag.retrieval.cache import CachedEntry, get_cached, set_cached
 from app.rag.retrieval.filters import extract_filters
 from app.rag.retrieval.faithfulness import check_faithfulness
 from app.rag.retrieval.generate import generate_answer, truncate_contexts
 from app.rag.retrieval.retriever import get_retriever
 from app.rag.retrieval.rewrite import rewrite_query
+
+
+async def resolve_text_for_chunk_ids(
+    chunk_ids: list[str], org_id: str
+) -> list[dict]:
+    if not chunk_ids:
+        return []
+    sm = get_sessionmaker()
+    async with sm() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(Chunk.id, Chunk.chunk_text).where(
+                        Chunk.id.in_(chunk_ids), Chunk.org_id == org_id
+                    )
+                )
+            )
+            .all()
+        )
+    by_id = {str(row.id): row.chunk_text for row in rows}
+    return [
+        {"id": cid, "text": by_id[cid]}
+        for cid in chunk_ids
+        if cid in by_id  # drop rows that vanished (version flips) or fail RBAC
+    ]
 
 
 async def run_query(
@@ -640,14 +673,21 @@ async def run_query(
         all_chunks.extend(
             await retriever.retrieve(q, org_id, user_ids, filters.to_payload(), limit=5)
         )
-    seen, contexts = set(), []
+    seen: set = set()
+    chunk_ids: list[str] = []
+    doc_by_chunk: dict[str, str] = {}
     for c in all_chunks:
         if c.chunk_id in seen:
             continue
         seen.add(c.chunk_id)
-        contexts.append({"id": c.chunk_id, "text": c.payload.get("chunk_text_hash", "")})
-        if len(contexts) >= 8:
+        chunk_ids.append(c.chunk_id)
+        doc_by_chunk[c.chunk_id] = str(c.payload.get("doc_id", ""))
+        if len(chunk_ids) >= 8:
             break
+
+    # enrich from Postgres — Qdrant payload carries only chunk_text_hash, never real text
+    resolved = await resolve_text_for_chunk_ids(chunk_ids[:8], org_id)
+    contexts = [{"id": r["id"], "text": r["text"]} for r in resolved]
 
     # configurable context budget before generation
     contexts = truncate_contexts(contexts, settings.max_context_tokens)
@@ -688,17 +728,17 @@ async def run_query(
         yield {"type": "output_warning", "warnings": warnings}
 
     chunk_ids = [c["id"] for c in contexts]
-    doc_ids = list({c["id"].split(":")[0] for c in contexts})
+    doc_ids = list({doc_by_chunk[c["id"]] for c in contexts if c["id"] in doc_by_chunk})
     if cache_on:
         await set_cached(
             org_id,
             cleaned,
-            {
-                "answer": answer,
-                "chunk_ids": chunk_ids,
-                "doc_ids": doc_ids,
-                "faithful": True,
-            },
+            CachedEntry(
+                answer=answer,
+                chunk_ids=chunk_ids,
+                doc_ids=doc_ids,
+                faithful=True,
+            ),
         )
     yield {"type": "done", "answer": answer, "chunk_ids": chunk_ids, "doc_ids": doc_ids}
 ```

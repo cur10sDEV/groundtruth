@@ -158,8 +158,8 @@ git commit -m "feat(obs): add Langfuse trace helper with no-op fallback"
 
 **Interfaces:**
 - Produces: each stage in `run_query` is wrapped in `with trace_step("stage_name", trace_id):`
-  recording input/output. Stages: `guardrails`, `cache`, `rewrite`, `filters`, `retrieve`,
-  `rerank`, `generate`, `faithfulness`.
+  recording input/output. Stages: `guardrails`, `guard_model`, `cache`, `rewrite`, `filters`,
+  `retrieve`, `rerank`, `generate`, `faithfulness`, `output_validation`.
 
 - [ ] **Step 1: Write a span-presence test**
 
@@ -185,7 +185,8 @@ In `orchestrator.py`, add at top:
 ```python
 from app.core.telemetry import trace_step
 ```
-Wrap the guardrail, cache, rewrite, filters, retrieve, rerank, generate, and faithfulness blocks
+Wrap the guardrails, guard_model, cache, rewrite, filters, retrieve, rerank, generate,
+faithfulness, and output-validation blocks
 with `with trace_step("guardrails", trace_id):` etc. (Task 6.1 gives the API.)
 
 - [ ] **Step 4: Run tests to verify pass**

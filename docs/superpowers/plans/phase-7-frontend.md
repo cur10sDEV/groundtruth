@@ -284,7 +284,14 @@ git commit -m "feat(frontend): scaffold Next.js app with auth pages and api clie
 `frontend/lib/stream.ts`:
 ```ts
 export type StreamEvent = {
-  type: "status" | "token" | "faithfulness" | "override" | "done";
+  type:
+    | "status" // stage: guardrails | guard_model | cache | rewrite | filters | retrieve
+    | "meta" // model_used surfaced before tokens
+    | "token"
+    | "faithfulness"
+    | "override"
+    | "output_warning"
+    | "done";
   [key: string]: any;
 };
 

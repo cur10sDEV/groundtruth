@@ -232,27 +232,50 @@ async def rerank(query: str, contexts: list[dict], top_n: int = 5) -> list[dict]
         return contexts
 ```
 
-Update `orchestrator.py` retrieval block:
+Update `orchestrator.py` filter + retrieval blocks (variable names match the final Phase 4
+orchestrator: the effective query is `cleaned`, contexts are enriched from Postgres, then
+truncated to the token budget):
+
+Filter extraction gate (replaces the unconditional `extract_filters` call):
 ```python
-    # retrieve (respect multi_query flag)
+    if flags.get("filter_extraction.enabled", True):
+        filters = await extract_filters(cleaned)
+    else:
+        filters = None
+    yield {"type": "status", "stage": "filters"}
+```
+
+Retrieval block (replaces the fixed `rewritten.queries[:3]` loop; note `filter_payload`):
+```python
     retriever = get_retriever()
-    queries = rewritten.queries[:3] if flags.get("multi_query.enabled", True) else [rewritten.canonical]
+    queries = (
+        rewritten.queries[:3]
+        if flags.get("multi_query.enabled", True)
+        else [rewritten.canonical]
+    )
+    filter_payload = filters.to_payload() if filters else {}
     all_chunks = []
     for q in queries:
         all_chunks.extend(
-            await retriever.retrieve(q, org_id, user_ids, filters.to_payload(), limit=5)
+            await retriever.retrieve(q, org_id, user_ids, filter_payload, limit=5)
         )
-    ...
-    # reranker gate
-    if flags.get("reranker.enabled", False):
-        from app.rag.retrieval.rerank import rerank
-        try:
-            contexts = await rerank(query, contexts, top_n=5)
-        except RerankerDisabledError:
-            pass
 ```
 
-Update `routes_query.py`:
+Reranker gate (after Postgres enrichment + `truncate_contexts`, before generation — rerank scores
+real text, so it MUST run after enrichment and MUST respect the token budget by re-truncating.
+Fail-open per spec: flag on but provider unset/down → keep original order, never break the query):
+```python
+    if flags.get("reranker.enabled", False):
+        from app.rag.retrieval.rerank import rerank, RerankerDisabledError
+
+        try:
+            contexts = await rerank(cleaned, contexts, top_n=5)
+            contexts = truncate_contexts(contexts, settings.max_context_tokens)
+        except RerankerDisabledError:
+            pass  # flagged on but not configured — fail open
+```
+
+Also update `routes_query.py` to pass live flags (replacing the Phase 4 hardcoded dict):
 ```python
 from app.core.flags import get_feature_flags
 ...
@@ -262,13 +285,6 @@ async for ev in run_query(
     body.query, user["org_id"], [user["user_id"]],
     feature_flags=feature_flags, trace_id=trace_id,
 ):
-```
-
-Also gate filter extraction in the orchestrator:
-```python
-    filters = (await extract_filters(query)) if flags.get("filter_extraction.enabled", True) else {}
-    if not isinstance(filters, dict):
-        filters = filters.to_payload()
 ```
 
 - [ ] **Step 4: Run tests to verify pass**
