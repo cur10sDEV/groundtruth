@@ -432,6 +432,8 @@ services:
     image: prom/prometheus:latest
     container_name: rag-prometheus
     ports: ["9090:9090"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - "./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml"
     depends_on:
@@ -507,10 +509,9 @@ providers:
       path: /var/lib/grafana/dashboards
 ```
 
-`infra/langfuse/docker-compose.langfuse.yml`:
+`infra/langfuse/docker-compose.langfuse.yml` (no top-level `name:` — merged runs inherit the
+main project `rag-prod`):
 ```yaml
-version: "3.9"
-name: rag-langfuse
 services:
   langfuse:
     image: langfuse/langfuse:latest
