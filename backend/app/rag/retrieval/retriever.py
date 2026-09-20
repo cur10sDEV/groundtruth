@@ -36,7 +36,7 @@ class Retriever:
         for p in points:
             out.append(
                 RetrievedChunk(
-                    chunk_id=p["id"],
+                    chunk_id=str(p["id"]),
                     text=p.get("payload", {}).get("chunk_text_hash", ""),
                     score=p.get("score", 0.0),
                     payload=p.get("payload", {}),
