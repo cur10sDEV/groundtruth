@@ -57,3 +57,12 @@ def test_validate_output_blocks_secret_leak():
     cleaned, warnings = validate_output("the api_key = sk-123456")
     assert "sk-123456" not in cleaned
     assert warnings
+
+
+def test_validate_output_secret_masking_is_non_lossy():
+    cleaned, warnings = validate_output("Sure. Your password is hunter2, thanks for asking.")
+    assert "Sure." in cleaned
+    assert "thanks for asking." in cleaned
+    assert "hunter2" not in cleaned
+    assert "[REDACTED]" in cleaned
+    assert "secret pattern masked" in warnings

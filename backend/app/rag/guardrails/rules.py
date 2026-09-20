@@ -93,7 +93,7 @@ def validate_output(text: str) -> tuple[str, list[str]]:
         warnings.append("PII masked in output")
     for pat in _SECRET_PATTERNS:
         if pat.search(masked):
-            masked = re.sub(r"\S+", "[REDACTED]", pat.search(masked).group())
+            masked = pat.sub("[REDACTED]", masked)
             warnings.append("secret pattern masked")
     for pat in _HARMFUL_PATTERNS:
         if pat.search(masked):

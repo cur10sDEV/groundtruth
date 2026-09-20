@@ -372,6 +372,15 @@ def test_validate_output_blocks_secret_leak():
     cleaned, warnings = validate_output("the api_key = sk-123456")
     assert "sk-123456" not in cleaned
     assert warnings
+
+
+def test_validate_output_secret_masking_is_non_lossy():
+    cleaned, warnings = validate_output("Sure. Your password is hunter2, thanks for asking.")
+    assert "Sure." in cleaned
+    assert "thanks for asking." in cleaned
+    assert "hunter2" not in cleaned
+    assert "[REDACTED]" in cleaned
+    assert "secret pattern masked" in warnings
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -478,7 +487,7 @@ def validate_output(text: str) -> tuple[str, list[str]]:
         warnings.append("PII masked in output")
     for pat in _SECRET_PATTERNS:
         if pat.search(masked):
-            masked = re.sub(r"\S+", "[REDACTED]", pat.search(masked).group())
+            masked = pat.sub("[REDACTED]", masked)
             warnings.append("secret pattern masked")
     for pat in _HARMFUL_PATTERNS:
         if pat.search(masked):
