@@ -1,5 +1,3 @@
-version: "3.9"
-name: rag-langfuse
 services:
   langfuse:
     image: langfuse/langfuse:latest

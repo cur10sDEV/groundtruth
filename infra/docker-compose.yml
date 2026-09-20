@@ -105,6 +105,7 @@ services:
     image: prom/prometheus:latest
     container_name: rag-prometheus
     ports: ["9090:9090"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
     volumes:
       - "./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml"
     depends_on:
