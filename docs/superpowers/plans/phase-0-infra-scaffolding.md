@@ -652,6 +652,7 @@ git commit -m "feat(backend): add FastAPI app skeleton with health route"
     - `NotFoundError(status 404)`
   - `register_exception_handlers(app: FastAPI) -> None` — maps `DomainError` (and subclasses) to
     JSON `{"error": detail, "trace_id": ...}`; always includes a `trace_id`.
+  - Also wire `register_exception_handlers(app)` inside `create_app()` (main.py) and add a real-factory test asserting the `{"error", "trace_id"}` JSON shape.
 
 - [ ] **Step 1: Write the failing error test**
 

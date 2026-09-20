@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.core.config import get_settings
+from app.core.errors import register_exception_handlers
 from app.core.logging import setup_logging
 
 
@@ -19,4 +20,5 @@ def create_app() -> FastAPI:
     from app.api.routes_health import router as health_router
 
     app.include_router(health_router)
+    register_exception_handlers(app)
     return app

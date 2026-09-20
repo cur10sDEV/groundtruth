@@ -6,6 +6,7 @@ from app.core.errors import (
     NotFoundError,
     register_exception_handlers,
 )
+from app.main import create_app
 
 
 def test_domain_error_status_and_detail():
@@ -28,3 +29,18 @@ def test_register_exception_handlers_returns_json_with_trace_id():
     body = resp.json()
     assert body["error"] == "kaboom"
     assert "trace_id" in body
+
+
+def test_app_factory_returns_trace_id_json_for_domain_errors():
+    app = create_app()
+
+    async def boom() -> None:
+        raise NotFoundError(detail="missing")
+
+    app.add_api_route("/boom", boom)
+    with TestClient(app) as client:
+        resp = client.get("/boom")
+        assert resp.status_code == 404
+        body = resp.json()
+        assert body["error"] == "missing"
+        assert "trace_id" in body
