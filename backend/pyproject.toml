@@ -39,6 +39,10 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = ["."]
+markers = [
+    "integration: requires live infrastructure (run with: -m integration)",
+]
+addopts = "-m 'not integration'"
 
 [tool.ruff]
 line-length = 100
