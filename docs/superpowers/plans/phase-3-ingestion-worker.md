@@ -395,12 +395,14 @@ git commit -m "feat(ingestion): add ingestion pipeline with versioning and stale
 **Interfaces:**
 - Consumes: `get_settings`, `get_session`, `ingest_document`, `Document` model.
 - Produces:
-  - `declare_queues(channel) -> None` — declares `ingestion` (durable), `ingestion.dlq` (durable),
-    and a DLX (`ingestion.dlx`) binding retries to DLQ after `x-dead-letter` with max retry.
+  - `declare_queues(channel) -> None` — declares `ingestion` (durable, DLX `ingestion.dlx` →
+    `ingestion.dlq`, no TTL on the work queue), `ingestion.retry` (durable, `x-message-ttl: 30000`,
+    dead-letters back to `ingestion` via the default exchange), and binds the DLQ to the DLX.
   - `async process_message(body: dict) -> None` — looks up Document by id, calls `ingest_document`,
     raises on failure (so the queue can retry/DLQ).
-  - `async consume_loop() -> None` — connects via aio-pika, consumes `ingestion`, acks on success,
-    rejects-to-DLQ on `IngestionError` after retries.
+  - `async consume_loop() -> None` — connects via aio-pika, consumes `ingestion`, acks on success;
+    on failure republishes to `ingestion.retry` (preserving `x-death` headers) until the
+    `ingestion.retry` death count reaches `MAX_RETRIES = 3`, then rejects to DLQ.
   - `run_worker() -> None` — entrypoint (`python -m app.ingestion.worker`).
 
 - [ ] **Step 1: Write the failing consumer test**
@@ -424,39 +426,50 @@ Expected: FAIL.
 
 `backend/app/ingestion/consumer.py`:
 ```python
-import asyncio
 import json
 import logging
 
-from aio_pika import ExchangeType, Message, connect_robust
+from aio_pika import DeliveryMode, ExchangeType, Message, connect_robust
+from aio_pika.abc import AbstractChannel, AbstractIncomingMessage
 
 from app.core.config import get_settings
 from app.core.errors import IngestionError
-from app.models.document import Document, DocumentStatus
 from app.db import get_session
+from app.models.document import Document, DocumentStatus
 from app.rag.ingestion.pipeline import ingest_document
 
 logger = logging.getLogger(__name__)
 QUEUE = "ingestion"
 DLQ = "ingestion.dlq"
+RETRY = "ingestion.retry"
+MAX_RETRIES = 3
 
 
-async def declare(channel) -> None:
+async def declare_queues(channel: AbstractChannel) -> None:
     dlx = await channel.declare_exchange("ingestion.dlx", ExchangeType.DIRECT, durable=True)
-    await channel.declare_queue(
-        DLQ, durable=True, arguments={"x-queue-mode": "lazy"}
-    )
-    await dlx.bind(channel.get_exchange(""), routing_key=DLQ)
+    dlq = await channel.declare_queue(DLQ, durable=True, arguments={"x-queue-mode": "lazy"})
+    await dlq.bind(dlx, routing_key=DLQ)
     await channel.declare_queue(
         QUEUE,
         durable=True,
         arguments={
             "x-dead-letter-exchange": "ingestion.dlx",
             "x-dead-letter-routing-key": DLQ,
-            "x-message-ttl": 30000,
             "x-max-length": 10000,
         },
     )
+    await channel.declare_queue(
+        RETRY,
+        durable=True,
+        arguments={
+            "x-message-ttl": 30000,
+            "x-dead-letter-exchange": "",
+            "x-dead-letter-routing-key": QUEUE,
+        },
+    )
+
+
+declare = declare_queues
 
 
 async def process_message(body: dict) -> None:
@@ -473,22 +486,49 @@ async def process_message(body: dict) -> None:
     await ingest_document(doc_id, s3_key)
 
 
+def _retry_count(message: AbstractIncomingMessage) -> int:
+    deaths = (message.headers or {}).get("x-death") or []
+    for entry in deaths:
+        if entry.get("queue") == RETRY:
+            return int(entry.get("count", 0))
+    return 0
+
+
 async def consume_loop() -> None:
     settings = get_settings()
     connection = await connect_robust(settings.rabbitmq_url)
     channel = await connection.channel()
     await channel.set_qos(prefetch_count=4)
-    await declare(channel)
+    await declare_queues(channel)
     queue = await channel.get_queue(QUEUE)
     async with queue.iterator() as qiter:
         async for message in qiter:
-            async with message.process(requeue=False):
-                try:
-                    body = json.loads(message.body)
-                    await process_message(body)
-                except Exception:
-                    logger.exception("ingestion failed, moving to DLQ", extra={"body": message.body})
-                    raise
+            try:
+                body = json.loads(message.body)
+                await process_message(body)
+                await message.ack()
+            except Exception:
+                retries = _retry_count(message)
+                if retries >= MAX_RETRIES:
+                    logger.exception(
+                        "ingestion failed after retries, moving to DLQ",
+                        extra={"body": message.body, "retries": retries},
+                    )
+                    await message.reject(requeue=False)
+                else:
+                    logger.exception(
+                        "ingestion failed, scheduling retry",
+                        extra={"body": message.body, "retries": retries},
+                    )
+                    await channel.default_exchange.publish(
+                        Message(
+                            body=message.body,
+                            headers=dict(message.headers or {}),
+                            delivery_mode=DeliveryMode.PERSISTENT,
+                        ),
+                        routing_key=RETRY,
+                    )
+                    await message.ack()
 ```
 
 `backend/app/ingestion/worker.py`:
@@ -577,7 +617,7 @@ async def publish_ingestion(doc_id: str, s3_key: str) -> None:
     connection = await connect_robust(settings.rabbitmq_url)
     try:
         channel = await connection.channel()
-        await declare(channel)
+        await declare(channel)  # declares ingestion, ingestion.retry (TTL dead-letters back), DLQ
         await channel.default_exchange.publish(
             json.dumps({"doc_id": doc_id, "s3_key": s3_key}).encode(),
             routing_key=QUEUE,
