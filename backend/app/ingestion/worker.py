@@ -9,5 +9,9 @@ async def main() -> None:
     await consume_loop()
 
 
-if __name__ == "__main__":
+def run_worker() -> None:
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    run_worker()
