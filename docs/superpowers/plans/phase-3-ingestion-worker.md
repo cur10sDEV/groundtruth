@@ -271,6 +271,18 @@ async def ingest_document(doc_id: str, s3_key: str) -> int:
         doc.status = DocumentStatus.PROCESSING
         await session.commit()
 
+        # NOTE (failure path, as implemented in app/rag/ingestion/pipeline.py):
+        # everything below runs inside try/except; on any exception the document
+        # is marked FAILED and, if any batch was already upserted, Qdrant points
+        # for THIS (doc_id, version) are best-effort deleted so partial batches
+        # never leave orphaned, searchable duplicates:
+        #     delete_points([], {"must": [
+        #         {"key": "doc_id", "match": {"value": doc_id}},
+        #         {"key": "version", "match": {"value": chunk_version}},
+        #     ]})
+        # wrapped in try/except (cleanup failure is logged, never raised) so it
+        # cannot mask the original error.
+
         raw = get_object(s3_key)
         content_hash = _hash(raw)
         if content_hash == doc.content_hash:

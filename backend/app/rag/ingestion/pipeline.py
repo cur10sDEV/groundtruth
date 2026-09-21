@@ -29,7 +29,26 @@ def _is_persistable(text: str) -> bool:
     return bool(stripped) and not set(stripped) <= {"#"}
 
 
-async def _embed_and_store(doc: Document, chunks: list[dict]) -> None:
+def _cleanup_partial_qdrant(doc_id: str, version: int) -> None:
+    try:
+        delete_points(
+            [],
+            {
+                "must": [
+                    {"key": "doc_id", "match": {"value": doc_id}},
+                    {"key": "version", "match": {"value": version}},
+                ]
+            },
+        )
+    except Exception:
+        logger.warning(
+            "failed to delete orphaned qdrant points",
+            extra={"doc_id": doc_id, "version": version},
+            exc_info=True,
+        )
+
+
+async def _embed_and_store(doc: Document, chunks: list[dict], upserted: list[str]) -> None:
     for i in range(0, len(chunks), EMBED_BATCH):
         batch = chunks[i : i + EMBED_BATCH]
         texts = [c["chunk_text"] for c in batch]
@@ -58,6 +77,7 @@ async def _embed_and_store(doc: Document, chunks: list[dict]) -> None:
                 }
             )
         upsert_points_batch(points)
+        upserted.extend(p["id"] for p in points)
 
 
 async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
@@ -69,6 +89,7 @@ async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
         dedup = version is None
         doc.status = DocumentStatus.PROCESSING
         await session.commit()
+        upserted: list[str] = []
         try:
             raw = get_object(s3_key)
             content_hash = _hash(raw)
@@ -105,7 +126,7 @@ async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
                         }
                     )
 
-            await _embed_and_store(doc, chunks)
+            await _embed_and_store(doc, chunks, upserted)
 
             session.add_all(
                 Chunk(
@@ -131,6 +152,8 @@ async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
             await session.commit()
             return len(chunks)
         except Exception:
+            if upserted:
+                _cleanup_partial_qdrant(doc_id, chunk_version)
             doc.status = DocumentStatus.FAILED
             await session.commit()
             raise

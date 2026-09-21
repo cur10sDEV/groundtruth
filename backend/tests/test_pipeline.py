@@ -306,6 +306,39 @@ async def test_ingest_document_marks_failed_on_embedding_error(
     assert await _chunks_for() == []
 
 
+async def test_ingest_failure_deletes_partial_qdrant_points(
+    db, fake_s3, fake_qdrant, fake_embeddings, monkeypatch
+):
+    body = "\n\n".join(f"Paragraph {i} with a few words." for i in range(40)).encode()
+    fake_s3[S3_KEY] = body
+    await _seed_doc(content_hash="different")
+
+    upsert_calls = []
+
+    def failing_upsert_points_batch(points):
+        upsert_calls.append(len(points))
+        if len(upsert_calls) >= 2:
+            raise RuntimeError("qdrant down mid-batch")
+
+    monkeypatch.setattr(pipeline, "upsert_points_batch", failing_upsert_points_batch)
+
+    with pytest.raises(RuntimeError):
+        await ingest_document(DOC_ID, S3_KEY)
+
+    assert upsert_calls == [32, 8]
+    assert (await _get_doc()).status == DocumentStatus.FAILED
+    assert await _chunks_for() == []
+    assert len(fake_qdrant["deletes"]) == 1
+    point_ids, payload_filter = fake_qdrant["deletes"][0]
+    assert point_ids == []
+    assert payload_filter == {
+        "must": [
+            {"key": "doc_id", "match": {"value": DOC_ID}},
+            {"key": "version", "match": {"value": 1}},
+        ]
+    }
+
+
 async def test_ingest_pdf_roundtrip_per_page(db, fake_s3, fake_qdrant, fake_embeddings):
     fake_s3[S3_KEY] = _build_pdf()
     await _seed_doc(filename="doc.pdf", content_hash="different")
