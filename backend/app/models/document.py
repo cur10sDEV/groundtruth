@@ -21,3 +21,4 @@ class Document(UUIDPkMixin, TimestampMixin, Base):
     status: Mapped[DocumentStatus] = mapped_column(Enum(DocumentStatus))
     content_hash: Mapped[str] = mapped_column(String(64), index=True)
     current_version: Mapped[int] = mapped_column(Integer, default=1)
+    pending_version: Mapped[int | None] = mapped_column(Integer)

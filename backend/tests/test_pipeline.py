@@ -319,8 +319,51 @@ async def test_ingest_cancelled_marks_failed_not_processing(db, fake_s3, fake_qd
     with pytest.raises(asyncio.CancelledError):
         await ingest_document(DOC_ID, S3_KEY)
 
-    assert (await _get_doc()).status == DocumentStatus.FAILED
+    doc = await _get_doc()
+    assert doc.status == DocumentStatus.FAILED
+    assert doc.pending_version is None
     assert fake_qdrant["deletes"] == []
+
+
+async def test_ingest_versioned_sets_pending_version_during_attempt(
+    db, fake_s3, fake_qdrant, fake_embeddings, fake_cache, monkeypatch
+):
+    fake_s3[S3_KEY] = b"Version two content with fresh words."
+    await _seed_doc(current_version=1)
+
+    observed = []
+
+    async def spying_dense_embed(texts):
+        doc = await _get_doc()
+        observed.append((doc.status, doc.pending_version))
+        return [[float(len(t)), 1.0] for t in texts]
+
+    monkeypatch.setattr(pipeline, "dense_embed", spying_dense_embed)
+
+    await ingest_versioned(DOC_ID, S3_KEY, 2)
+
+    assert observed
+    assert {(status, pending) for status, pending in observed} == {(DocumentStatus.PROCESSING, 2)}
+    doc = await _get_doc()
+    assert doc.status == DocumentStatus.EMBEDDED
+    assert doc.pending_version is None
+
+
+async def test_ingest_failure_clears_pending_version(db, fake_s3, fake_qdrant, monkeypatch):
+    fake_s3[S3_KEY] = b"Alpha beta gamma delta."
+    await _seed_doc(content_hash="different", current_version=1)
+
+    async def failing_dense_embed(texts):
+        raise RuntimeError("embed down")
+
+    monkeypatch.setattr(pipeline, "dense_embed", failing_dense_embed)
+
+    with pytest.raises(RuntimeError):
+        await ingest_document(DOC_ID, S3_KEY)
+
+    doc = await _get_doc()
+    assert doc.status == DocumentStatus.FAILED
+    assert doc.pending_version is None
 
 
 async def test_ingest_failure_deletes_partial_qdrant_points(

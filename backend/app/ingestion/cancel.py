@@ -1,6 +1,6 @@
 import logging
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 
 from app.core.qdrant_store import delete_points
 from app.db import get_session
@@ -17,14 +17,20 @@ async def cancel_document(doc_id: str) -> None:
         if doc is None:
             return
         doc.status = DocumentStatus.FAILED
-        partial_ids = list(
-            (await session.execute(select(Chunk.id).where(Chunk.doc_id == doc_id))).scalars().all()
-        )
-        if partial_ids:
+        pending = doc.pending_version
+        doc.pending_version = None
+        if pending is not None:
             delete_points(
-                partial_ids,
-                {"must": [{"key": "doc_id", "match": {"value": doc_id}}]},
+                [],
+                {
+                    "must": [
+                        {"key": "doc_id", "match": {"value": doc_id}},
+                        {"key": "version", "range": {"gte": pending}},
+                    ]
+                },
             )
-        await session.execute(delete(Chunk).where(Chunk.doc_id == doc_id))
+            await session.execute(
+                delete(Chunk).where(Chunk.doc_id == doc_id, Chunk.version >= pending)
+            )
         await session.commit()
     await publish_message({"doc_id": doc_id, "cancel": True})

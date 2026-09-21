@@ -14,6 +14,8 @@ router = APIRouter()
 async def minio_event(request: Request) -> dict:
     data = await request.json()
     for record in data.get("Records", []):
+        if "ObjectRemoved" in record.get("eventName", ""):
+            continue
         key = unquote(record.get("s3", {}).get("object", {}).get("key", ""))
         if not key:
             continue

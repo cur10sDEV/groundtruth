@@ -166,13 +166,17 @@ git commit -m "feat(ingestion): add PDF/DOCX/MD/TXT parsers"
 - Produces in `backend/app/rag/ingestion/pipeline.py`:
   - `async ingest_document(doc_id: str, s3_key: str) -> int` — full pipeline for ONE document at its
     CURRENT version; returns the new chunk count. Steps:
-    1. Load Document row; mark `PROCESSING`.
+    1. Load Document row; mark `PROCESSING` and set `pending_version` to the version being
+       ingested (same commit).
     2. Fetch raw bytes from S3.
-    3. Dedup via `content_hash`; if unchanged, mark `EMBEDDED` and return 0.
+    3. Dedup via `content_hash`; if unchanged, mark `EMBEDDED`, clear `pending_version`, return 0.
     4. Parse → chunk each page → enrich metadata (doc_id, user_id, org_id, page, offsets, version).
     5. Embed dense + sparse (batching), upsert to Qdrant with payload.
     6. Insert Chunk rows (version = current_version) into Postgres.
-    7. Mark `EMBEDDED`; commit. Return chunk count.
+    7. Mark `EMBEDDED`, clear `pending_version`; commit. Return chunk count.
+    `pending_version` is cleared to None on ALL exits (success, dedup short-circuit, Exception
+    failure, CancelledError) so it always reflects the in-flight attempt; cancellation cleanup
+    (Task 3.4) is version-scoped on it.
   - `async ingest_versioned(doc_id: str, s3_key: str, new_version: int) -> int` — writes chunks with
     `version = new_version`, then on success flips `documents.current_version` and invalidates cache.
   - `async cleanup_stale(doc_id: str) -> int` — deletes chunks/vectors with `version < current_version`.
@@ -273,15 +277,18 @@ async def ingest_document(doc_id: str, s3_key: str) -> int:
 
         # NOTE (failure path, as implemented in app/rag/ingestion/pipeline.py):
         # everything below runs inside try/except; on any exception the document
-        # is marked FAILED and, if any batch was already upserted, Qdrant points
-        # for THIS (doc_id, version) are best-effort deleted so partial batches
-        # never leave orphaned, searchable duplicates:
+        # is marked FAILED, `pending_version` is cleared to None, and, if any
+        # batch was already upserted, Qdrant points for THIS (doc_id, version)
+        # are best-effort deleted so partial batches never leave orphaned,
+        # searchable duplicates:
         #     delete_points([], {"must": [
         #         {"key": "doc_id", "match": {"value": doc_id}},
         #         {"key": "version", "match": {"value": chunk_version}},
         #     ]})
         # wrapped in try/except (cleanup failure is logged, never raised) so it
-        # cannot mask the original error.
+        # cannot mask the original error. `doc.pending_version = chunk_version`
+        # is set together with the PROCESSING commit and cleared to None on
+        # every exit (success, failure, cancellation).
 
         raw = get_object(s3_key)
         content_hash = _hash(raw)
@@ -474,14 +481,24 @@ declare = declare_queues
 
 async def process_message(body: dict) -> None:
     doc_id = body.get("doc_id")
+    if not doc_id:
+        raise IngestionError(detail="message missing doc_id")
+    if body.get("cancel"):
+        logger.info("document cancellation noticed", extra={"doc_id": doc_id})
+        return
     s3_key = body.get("s3_key")
-    if not doc_id or not s3_key:
-        raise IngestionError(detail="message missing doc_id/s3_key")
+    if not s3_key:
+        raise IngestionError(detail="message missing s3_key")
     async with get_session() as session:
         doc = await session.get(Document, doc_id)
         if doc is None:
             raise IngestionError(detail=f"unknown doc {doc_id}")
         if doc.status == DocumentStatus.EMBEDDED:
+            return
+        if doc.status == DocumentStatus.FAILED:
+            # post-cancel resurrect guard: a legitimate re-ingest is preceded by
+            # the upload flow resetting status, so FAILED docs are skipped+acked
+            logger.info("skipping cancelled document", extra={"doc_id": doc_id})
             return
     await ingest_document(doc_id, s3_key)
 
@@ -575,7 +592,11 @@ git commit -m "feat(ingestion): add RabbitMQ consumer with DLQ and retry"
   - `async publish_ingestion(doc_id: str, s3_key: str) -> None` in `publisher.py` — publishes a JSON
     message `{doc_id, s3_key}` to the `ingestion` queue.
   - `async cancel_document(doc_id: str) -> None` in `cancel.py` — marks document `FAILED` (or
-    `PENDING` on abort) and publishes a cancellation message the consumer checks; cleans partial rows.
+    `PENDING` on abort), clears `pending_version`, and publishes a cancellation message the
+    consumer checks; cleanup is version-scoped on `pending_version`: when an attempt is in
+    flight, only that attempt's partial chunk rows and Qdrant points (`version >=
+    pending_version`) are removed so the previous fully-embedded version stays intact and
+    searchable; when no attempt is in flight (queued-but-not-started), nothing is cleaned.
   - `async cleanup_job_loop(interval_seconds: int = 3600) -> None` in `cleanup_job.py` — periodically
     finds docs with stale chunks and calls `cleanup_stale`; batches with retries.
   - `register_minio_webhook(app) -> None` — exposes `POST /internal/minio-event` that parses an
@@ -630,7 +651,12 @@ async def publish_ingestion(doc_id: str, s3_key: str) -> None:
 ```python
 import logging
 
+from sqlalchemy import delete
+
+from app.core.qdrant_store import delete_points
 from app.db import get_session
+from app.ingestion.publisher import publish_message
+from app.models.chunk import Chunk
 from app.models.document import Document, DocumentStatus
 
 logger = logging.getLogger(__name__)
@@ -642,7 +668,25 @@ async def cancel_document(doc_id: str) -> None:
         if doc is None:
             return
         doc.status = DocumentStatus.FAILED
+        pending = doc.pending_version
+        doc.pending_version = None
+        if pending is not None:
+            # version-scoped: only the in-flight attempt's partials; the
+            # previous version's chunks/points are never touched
+            delete_points(
+                [],
+                {
+                    "must": [
+                        {"key": "doc_id", "match": {"value": doc_id}},
+                        {"key": "version", "range": {"gte": pending}},
+                    ]
+                },
+            )
+            await session.execute(
+                delete(Chunk).where(Chunk.doc_id == doc_id, Chunk.version >= pending)
+            )
         await session.commit()
+    await publish_message({"doc_id": doc_id, "cancel": True})
 ```
 
 `backend/app/ingestion/cleanup_job.py`:
@@ -685,8 +729,9 @@ async def cleanup_job_loop(interval_seconds: int = 3600) -> None:
 `backend/app/ingestion/minio_webhook.py`:
 ```python
 import logging
+from urllib.parse import unquote
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, FastAPI, Request
 
 from app.core.errors import IngestionError
 from app.ingestion.publisher import publish_ingestion
@@ -699,7 +744,10 @@ router = APIRouter()
 async def minio_event(request: Request) -> dict:
     data = await request.json()
     for record in data.get("Records", []):
-        key = record.get("s3", {}).get("object", {}).get("key", "")
+        if "ObjectRemoved" in record.get("eventName", ""):
+            continue
+        # s3.object.key arrives URL-encoded (%2F for "/")
+        key = unquote(record.get("s3", {}).get("object", {}).get("key", ""))
         if not key:
             continue
         parts = key.split("/")
@@ -709,6 +757,10 @@ async def minio_event(request: Request) -> dict:
         doc_id = parts[3]
         await publish_ingestion(doc_id, key)
     return {"status": "ok"}
+
+
+def register_minio_webhook(app: FastAPI) -> None:
+    app.include_router(router)
 ```
 
 - [ ] **Step 4: Run tests to verify pass**

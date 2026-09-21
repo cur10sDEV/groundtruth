@@ -29,6 +29,7 @@ Phase 0 (config, logging, errors, docker-compose). Backing services must be runn
 - Create: `backend/alembic.ini`
 - Create: `backend/alembic/env.py`
 - Create: `backend/alembic/versions/0001_initial.py`
+- Create: `backend/alembic/versions/0002_add_pending_version.py`
 - Test: `backend/tests/test_models.py`
 
 **Interfaces:**
@@ -42,7 +43,9 @@ Phase 0 (config, logging, errors, docker-compose). Backing services must be runn
     - `Organization(id, name, created_at)`
     - `Membership(id, user_id, org_id, role)`
     - `Document(id, user_id, org_id, original_filename, status, content_hash, current_version,
-      created_at, updated_at)`
+      pending_version, created_at, updated_at)` — `pending_version: int | None` is the
+      version of the in-flight ingest attempt (set by the pipeline alongside `PROCESSING`,
+      cleared on every exit); it scopes cancellation cleanup to the partial attempt.
     - `Chunk(id, doc_id, user_id, org_id, chunk_text, page_number, start_offset, end_offset,
       version, created_at, updated_at)`
     - `Citation(id, query_id, chunk_id, doc_id)`
@@ -201,6 +204,7 @@ class Document(UUIDPkMixin, TimestampMixin, Base):
     status: Mapped[DocumentStatus] = mapped_column(Enum(DocumentStatus))
     content_hash: Mapped[str] = mapped_column(String(64), index=True)
     current_version: Mapped[int] = mapped_column(Integer, default=1)
+    pending_version: Mapped[int | None] = mapped_column(Integer)
 ```
 
 `backend/app/models/chunk.py`:
@@ -341,6 +345,11 @@ Alembic migration `backend/alembic/versions/0001_initial.py` — create all tabl
 (sqlalchemy.url from env) and `backend/alembic/env.py` to import `app.models` so metadata is
 populated. For the reference, `init_db()` (create_all) is used in tests; the migration exists for
 real environments.
+Alembic migration `backend/alembic/versions/0002_add_pending_version.py` — adds
+`documents.pending_version` (nullable Integer). Because 0001 is create_all-driven (fresh
+databases already get the column via metadata), 0002 inspects existing columns and skips if
+`pending_version` is present, making `upgrade head` idempotent in both fresh and upgraded
+databases; the guarded `downgrade` drops the column only if present.
 
 - [ ] **Step 4: Run tests to verify pass**
 

@@ -52,6 +52,7 @@ async def _seed_doc(
     doc_id: str,
     current_version: int = 1,
     status: DocumentStatus = DocumentStatus.PENDING,
+    pending_version: int | None = None,
 ) -> None:
     async with get_session() as session:
         session.add(
@@ -63,6 +64,7 @@ async def _seed_doc(
                 status=status,
                 content_hash="hash",
                 current_version=current_version,
+                pending_version=pending_version,
             )
         )
         await session.commit()
@@ -134,10 +136,15 @@ async def test_publish_ingestion_publishes_wrapped_message_to_queue(monkeypatch)
     assert json.loads(message.body) == {"doc_id": DOC_ID, "s3_key": S3_KEY}
 
 
-async def test_cancel_document_marks_failed_cleans_rows_publishes_notice(db, monkeypatch):
+async def test_cancel_document_version_scoped_cleanup_preserves_previous_version(db, monkeypatch):
     chunk_v1 = await _seed_chunk(DOC_ID, version=1)
-    chunk_v2 = await _seed_chunk(DOC_ID, version=2)
-    await _seed_doc(DOC_ID, current_version=2, status=DocumentStatus.PROCESSING)
+    await _seed_chunk(DOC_ID, version=2)
+    await _seed_doc(
+        DOC_ID,
+        current_version=1,
+        status=DocumentStatus.PROCESSING,
+        pending_version=2,
+    )
 
     notices = []
     qdrant_deletes = []
@@ -146,7 +153,7 @@ async def test_cancel_document_marks_failed_cleans_rows_publishes_notice(db, mon
         notices.append((payload, routing_key))
 
     def fake_delete_points(point_ids, payload_filter=None):
-        qdrant_deletes.append((set(point_ids), payload_filter))
+        qdrant_deletes.append((point_ids, payload_filter))
 
     monkeypatch.setattr(cancel_module, "publish_message", fake_publish)
     monkeypatch.setattr(cancel_module, "delete_points", fake_delete_points)
@@ -155,14 +162,87 @@ async def test_cancel_document_marks_failed_cleans_rows_publishes_notice(db, mon
 
     doc = await _get_doc(DOC_ID)
     assert doc.status == DocumentStatus.FAILED
-    assert await _chunk_ids(DOC_ID) == set()
-    assert notices == [({"doc_id": DOC_ID, "cancel": True}, consumer.QUEUE)]
+    assert doc.pending_version is None
+    assert await _chunk_ids(DOC_ID) == {chunk_v1}
     assert qdrant_deletes == [
         (
-            {chunk_v1, chunk_v2},
-            {"must": [{"key": "doc_id", "match": {"value": DOC_ID}}]},
+            [],
+            {
+                "must": [
+                    {"key": "doc_id", "match": {"value": DOC_ID}},
+                    {"key": "version", "range": {"gte": 2}},
+                ]
+            },
         )
     ]
+    assert notices == [({"doc_id": DOC_ID, "cancel": True}, consumer.QUEUE)]
+
+
+async def test_cancel_document_first_ingest_removes_partials(db, monkeypatch):
+    await _seed_chunk(DOC_ID, version=1)
+    await _seed_doc(
+        DOC_ID,
+        current_version=1,
+        status=DocumentStatus.PROCESSING,
+        pending_version=1,
+    )
+
+    notices = []
+    qdrant_deletes = []
+
+    async def fake_publish(payload, routing_key=consumer.QUEUE):
+        notices.append((payload, routing_key))
+
+    def fake_delete_points(point_ids, payload_filter=None):
+        qdrant_deletes.append((point_ids, payload_filter))
+
+    monkeypatch.setattr(cancel_module, "publish_message", fake_publish)
+    monkeypatch.setattr(cancel_module, "delete_points", fake_delete_points)
+
+    await cancel_module.cancel_document(DOC_ID)
+
+    doc = await _get_doc(DOC_ID)
+    assert doc.status == DocumentStatus.FAILED
+    assert doc.pending_version is None
+    assert await _chunk_ids(DOC_ID) == set()
+    assert qdrant_deletes == [
+        (
+            [],
+            {
+                "must": [
+                    {"key": "doc_id", "match": {"value": DOC_ID}},
+                    {"key": "version", "range": {"gte": 1}},
+                ]
+            },
+        )
+    ]
+    assert notices == [({"doc_id": DOC_ID, "cancel": True}, consumer.QUEUE)]
+
+
+async def test_cancel_document_queued_not_started_cleans_nothing(db, monkeypatch):
+    chunk_v1 = await _seed_chunk(DOC_ID, version=1)
+    await _seed_doc(DOC_ID, current_version=1, status=DocumentStatus.PENDING)
+
+    notices = []
+    qdrant_deletes = []
+
+    async def fake_publish(payload, routing_key=consumer.QUEUE):
+        notices.append((payload, routing_key))
+
+    def fake_delete_points(point_ids, payload_filter=None):
+        qdrant_deletes.append((point_ids, payload_filter))
+
+    monkeypatch.setattr(cancel_module, "publish_message", fake_publish)
+    monkeypatch.setattr(cancel_module, "delete_points", fake_delete_points)
+
+    await cancel_module.cancel_document(DOC_ID)
+
+    doc = await _get_doc(DOC_ID)
+    assert doc.status == DocumentStatus.FAILED
+    assert doc.pending_version is None
+    assert await _chunk_ids(DOC_ID) == {chunk_v1}
+    assert qdrant_deletes == []
+    assert notices == [({"doc_id": DOC_ID, "cancel": True}, consumer.QUEUE)]
 
 
 async def test_cancel_document_missing_doc_is_noop(db, monkeypatch):
@@ -257,6 +337,31 @@ def test_minio_event_unquotes_url_encoded_s3_keys(monkeypatch):
 
     assert resp.status_code == 200
     assert published == [("doc-9", "documents/org-9/user-9/doc-9/9f8e7d6c.txt")]
+
+
+def test_minio_event_ignores_object_removed_events(monkeypatch):
+    published = []
+    client = _webhook_client(monkeypatch, published)
+
+    resp = client.post(
+        "/internal/minio-event",
+        json={
+            "Records": [
+                {
+                    "eventName": "s3:ObjectRemoved:Delete",
+                    "s3": {"object": {"key": "documents/org-1/user-1/doc-1/abc.pdf"}},
+                },
+                {
+                    "eventName": "s3:ObjectCreated:Put",
+                    "s3": {"object": {"key": "documents/org-1/user-1/doc-2/abc.pdf"}},
+                },
+            ]
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+    assert published == [("doc-2", "documents/org-1/user-1/doc-2/abc.pdf")]
 
 
 def test_minio_webhook_registered_on_production_app():

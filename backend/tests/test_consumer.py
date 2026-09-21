@@ -43,11 +43,11 @@ def _patch_session(monkeypatch, doc):
 async def test_process_message_missing_fields_raises():
     with pytest.raises(IngestionError) as excinfo:
         await process_message({})
-    assert "missing doc_id/s3_key" in excinfo.value.detail
+    assert "missing doc_id" in excinfo.value.detail
 
     with pytest.raises(IngestionError) as excinfo:
         await process_message({"doc_id": DOC_ID})
-    assert "missing doc_id/s3_key" in excinfo.value.detail
+    assert "missing s3_key" in excinfo.value.detail
 
 
 async def test_process_message_unknown_doc_raises(monkeypatch):
@@ -59,6 +59,18 @@ async def test_process_message_unknown_doc_raises(monkeypatch):
 
 async def test_process_message_embedded_short_circuits(monkeypatch):
     _patch_session(monkeypatch, _doc(DocumentStatus.EMBEDDED))
+    calls = []
+
+    async def must_not_ingest(doc_id, s3_key):
+        calls.append((doc_id, s3_key))
+
+    monkeypatch.setattr(consumer, "ingest_document", must_not_ingest)
+    await process_message({"doc_id": DOC_ID, "s3_key": S3_KEY})
+    assert calls == []
+
+
+async def test_process_message_failed_doc_skips_ingestion(monkeypatch):
+    _patch_session(monkeypatch, _doc(DocumentStatus.FAILED))
     calls = []
 
     async def must_not_ingest(doc_id, s3_key):

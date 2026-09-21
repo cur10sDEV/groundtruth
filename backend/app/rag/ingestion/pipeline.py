@@ -89,6 +89,7 @@ async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
         chunk_version = doc.current_version if version is None else version
         dedup = version is None
         doc.status = DocumentStatus.PROCESSING
+        doc.pending_version = chunk_version
         await session.commit()
         upserted: list[str] = []
         try:
@@ -96,6 +97,7 @@ async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
             content_hash = _hash(raw)
             if dedup and content_hash == doc.content_hash:
                 doc.status = DocumentStatus.EMBEDDED
+                doc.pending_version = None
                 await session.commit()
                 return 0
 
@@ -150,18 +152,21 @@ async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
             )
             doc.content_hash = content_hash
             doc.status = DocumentStatus.EMBEDDED
+            doc.pending_version = None
             await session.commit()
             return len(chunks)
         except asyncio.CancelledError:
             if upserted:
                 _cleanup_partial_qdrant(doc_id, chunk_version)
             doc.status = DocumentStatus.FAILED
+            doc.pending_version = None
             await session.commit()
             raise
         except Exception:
             if upserted:
                 _cleanup_partial_qdrant(doc_id, chunk_version)
             doc.status = DocumentStatus.FAILED
+            doc.pending_version = None
             await session.commit()
             raise
 

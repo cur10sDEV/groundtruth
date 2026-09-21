@@ -47,18 +47,21 @@ declare = declare_queues
 async def process_message(body: dict) -> None:
     doc_id = body.get("doc_id")
     if not doc_id:
-        raise IngestionError(detail="message missing doc_id/s3_key")
+        raise IngestionError(detail="message missing doc_id")
     if body.get("cancel"):
         logger.info("document cancellation noticed", extra={"doc_id": doc_id})
         return
     s3_key = body.get("s3_key")
     if not s3_key:
-        raise IngestionError(detail="message missing doc_id/s3_key")
+        raise IngestionError(detail="message missing s3_key")
     async with get_session() as session:
         doc = await session.get(Document, doc_id)
         if doc is None:
             raise IngestionError(detail=f"unknown doc {doc_id}")
         if doc.status == DocumentStatus.EMBEDDED:
+            return
+        if doc.status == DocumentStatus.FAILED:
+            logger.info("skipping cancelled document", extra={"doc_id": doc_id})
             return
     await ingest_document(doc_id, s3_key)
 
