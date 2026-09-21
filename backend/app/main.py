@@ -18,7 +18,9 @@ def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
     from app.api.routes_health import router as health_router
+    from app.ingestion.minio_webhook import register_minio_webhook
 
     app.include_router(health_router)
+    register_minio_webhook(app)
     register_exception_handlers(app)
     return app

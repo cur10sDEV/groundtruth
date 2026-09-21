@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 from uuid import uuid4
 
@@ -151,6 +152,12 @@ async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
             doc.status = DocumentStatus.EMBEDDED
             await session.commit()
             return len(chunks)
+        except asyncio.CancelledError:
+            if upserted:
+                _cleanup_partial_qdrant(doc_id, chunk_version)
+            doc.status = DocumentStatus.FAILED
+            await session.commit()
+            raise
         except Exception:
             if upserted:
                 _cleanup_partial_qdrant(doc_id, chunk_version)

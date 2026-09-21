@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import io
 
@@ -304,6 +305,22 @@ async def test_ingest_document_marks_failed_on_embedding_error(
 
     assert (await _get_doc()).status == DocumentStatus.FAILED
     assert await _chunks_for() == []
+
+
+async def test_ingest_cancelled_marks_failed_not_processing(db, fake_s3, fake_qdrant, monkeypatch):
+    fake_s3[S3_KEY] = b"Alpha beta gamma delta."
+    await _seed_doc(content_hash="different")
+
+    async def cancelled_dense_embed(texts):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(pipeline, "dense_embed", cancelled_dense_embed)
+
+    with pytest.raises(asyncio.CancelledError):
+        await ingest_document(DOC_ID, S3_KEY)
+
+    assert (await _get_doc()).status == DocumentStatus.FAILED
+    assert fake_qdrant["deletes"] == []
 
 
 async def test_ingest_failure_deletes_partial_qdrant_points(
