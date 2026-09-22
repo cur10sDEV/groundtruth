@@ -104,15 +104,14 @@ def fake_embeddings(monkeypatch):
 
 @pytest.fixture
 def fake_cache(monkeypatch):
-    patterns: list[str] = []
+    calls: list[tuple[str, str]] = []
 
-    class _FakeCache:
-        async def delete_by_pattern(self, pattern: str) -> int:
-            patterns.append(pattern)
-            return 0
+    async def fake_invalidate_for_doc(org_id: str, doc_id: str) -> int:
+        calls.append((org_id, doc_id))
+        return 0
 
-    monkeypatch.setattr(pipeline, "get_cache", lambda: _FakeCache())
-    return patterns
+    monkeypatch.setattr(pipeline, "invalidate_for_doc", fake_invalidate_for_doc)
+    return calls
 
 
 async def _seed_doc(
@@ -444,7 +443,7 @@ async def test_ingest_versioned_writes_new_version_then_flips(
     doc = await _get_doc()
     assert doc.current_version == 2
     assert doc.status == DocumentStatus.EMBEDDED
-    assert fake_cache == [f"retrieval:{DOC_ID}:*"]
+    assert fake_cache == [(ORG_ID, DOC_ID)]
     for point in fake_qdrant["upserts"]:
         assert point["payload"]["version"] == 2
 
@@ -461,7 +460,7 @@ async def test_ingest_versioned_reingests_unchanged_content_at_new_version(
     assert count >= 1
     assert {r.version for r in await _chunks_for()} == {2}
     assert (await _get_doc()).current_version == 2
-    assert fake_cache == [f"retrieval:{DOC_ID}:*"]
+    assert fake_cache == [(ORG_ID, DOC_ID)]
 
 
 async def test_ingest_versioned_failure_keeps_current_version(

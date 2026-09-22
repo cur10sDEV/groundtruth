@@ -22,6 +22,9 @@ class RedisCache:
     async def delete(self, key: str) -> None:
         await self._r.delete(key)
 
+    async def keys_by_pattern(self, pattern: str) -> list[str]:
+        return [k async for k in self._r.scan_iter(match=pattern)]
+
     async def delete_by_pattern(self, pattern: str) -> int:
         keys = [k async for k in self._r.scan_iter(match=pattern)]
         if keys:

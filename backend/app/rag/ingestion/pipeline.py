@@ -7,7 +7,6 @@ from sqlalchemy import select
 from app.core.errors import IngestionError
 from app.core.logging import get_logger
 from app.core.qdrant_store import delete_points, upsert_points_batch
-from app.core.redis_store import get_cache
 from app.core.s3 import get_object
 from app.db import get_session
 from app.models.chunk import Chunk
@@ -15,10 +14,10 @@ from app.models.document import Document, DocumentStatus
 from app.rag.chunkers.text import get_chunker
 from app.rag.embed.embeddings import dense_embed, sparse_embed
 from app.rag.ingestion.parsers import parse_bytes
+from app.rag.retrieval.cache import invalidate_for_doc
 
 logger = get_logger(__name__)
 EMBED_BATCH = 32
-CACHE_PATTERN = "retrieval:{doc_id}:*"
 
 
 def _hash(data: bytes) -> str:
@@ -183,13 +182,13 @@ async def ingest_versioned(doc_id: str, s3_key: str, new_version: int) -> int:
             raise IngestionError(detail=f"document not found: {doc_id}")
         doc.current_version = new_version
         await session.commit()
-    await _invalidate_cache(doc_id)
+    await _invalidate_cache(doc_id, doc.org_id)
     return count
 
 
-async def _invalidate_cache(doc_id: str) -> None:
+async def _invalidate_cache(doc_id: str, org_id: str) -> None:
     try:
-        await get_cache().delete_by_pattern(CACHE_PATTERN.format(doc_id=doc_id))
+        await invalidate_for_doc(org_id, doc_id)
     except Exception:
         logger.warning("cache invalidation failed", extra={"doc_id": doc_id})
 
