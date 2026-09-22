@@ -19,7 +19,8 @@ dependencies = [
     "openai>=1.54",
     "python-multipart>=0.0.12",
     "PyJWT>=2.9",
-    "passlib[bcrypt]>=1.7",
+    "passlib>=1.7",
+    "bcrypt>=4.0,<5",
     "alembic>=1.14",
     "flagsmith>=3.8",
     "langfuse>=2.54",
@@ -52,3 +53,6 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.params.Depends"]
