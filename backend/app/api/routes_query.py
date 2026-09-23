@@ -9,6 +9,7 @@ from sqlalchemy import select
 from app.auth.dependencies import get_current_user
 from app.core.config import get_settings
 from app.core.errors import RateLimitError, ValidationError
+from app.core.flags import get_feature_flags
 from app.core.logging import new_correlation_id
 from app.core.redis_store import get_limiter
 from app.db import get_session
@@ -46,11 +47,12 @@ async def query_endpoint(
     trace_id = new_correlation_id()
 
     async def event_stream():
+        feature_flags = await get_feature_flags()
         async for ev in run_query(
             body.query,
             user["org_id"],
             [user["user_id"]],
-            feature_flags={"cache.enabled": True, "faithfulness.enabled": True},
+            feature_flags=feature_flags,
             trace_id=trace_id,
         ):
             yield f"data: {json.dumps(ev)}\n\n"

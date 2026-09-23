@@ -11,6 +11,7 @@ from app.rag.retrieval.cache import CachedEntry, get_cached, set_cached
 from app.rag.retrieval.faithfulness import check_faithfulness
 from app.rag.retrieval.filters import extract_filters
 from app.rag.retrieval.generate import generate_answer, truncate_contexts
+from app.rag.retrieval.rerank import RerankerDisabledError, rerank
 from app.rag.retrieval.retriever import get_retriever
 from app.rag.retrieval.rewrite import rewrite_query
 
@@ -85,17 +86,22 @@ async def run_query(
     rewritten = await rewrite_query(cleaned)
     yield {"type": "status", "stage": "rewrite"}
 
-    # filters
-    filters = await extract_filters(cleaned)
+    # filters (flag-gated: off → no LLM filter extraction, empty payload downstream)
+    if flags.get("filter_extraction.enabled", True):
+        filters = await extract_filters(cleaned)
+    else:
+        filters = None
     yield {"type": "status", "stage": "filters"}
 
-    # retrieve
+    # retrieve (multi-query flag decides whether to expand beyond the canonical query)
     retriever = get_retriever()
+    queries = (
+        rewritten.queries[:3] if flags.get("multi_query.enabled", True) else [rewritten.canonical]
+    )
+    filter_payload = filters.to_payload() if filters else {}
     all_chunks = []
-    for q in rewritten.queries[:3]:
-        all_chunks.extend(
-            await retriever.retrieve(q, org_id, user_ids, filters.to_payload(), limit=5)
-        )
+    for q in queries:
+        all_chunks.extend(await retriever.retrieve(q, org_id, user_ids, filter_payload, limit=5))
     seen: set = set()
     chunk_ids: list[str] = []
     doc_by_chunk: dict[str, str] = {}
@@ -126,6 +132,19 @@ async def run_query(
             "doc_ids": [],
         }
         return
+
+    # reranker gate — scores the real (enriched) texts, so it runs after enrichment
+    # + truncation, then re-truncates because the reranked order/top_n may change the
+    # budget fit. Fail-open per spec: flagged on but not configured or the reranker
+    # errors → keep original order, never break the query.
+    if flags.get("reranker.enabled", False):
+        try:
+            contexts = await rerank(cleaned, contexts, top_n=5)
+            contexts = truncate_contexts(contexts, settings.max_context_tokens)
+        except RerankerDisabledError:
+            pass  # flagged on but not configured — fail open
+        except Exception as exc:
+            logger.warning("rerank failed, keeping original order", extra={"exc": str(exc)})
 
     # generate (stream), capture model_used
     answer_parts = []

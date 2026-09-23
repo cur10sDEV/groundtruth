@@ -48,6 +48,17 @@ def _auth(token: str) -> dict:
 async def test_post_query_streams_sse_events(client, monkeypatch):
     c, limiter = client
     captured = {}
+    stub_flags = {
+        "cache.enabled": False,
+        "multi_query.enabled": False,
+        "filter_extraction.enabled": False,
+        "reranker.enabled": True,
+        "faithfulness.enabled": True,
+        "guard_model.enabled": False,
+    }
+
+    async def stub_get_feature_flags():
+        return dict(stub_flags)
 
     async def stub_run_query(query, org_id, user_ids, feature_flags, trace_id):
         captured.update(
@@ -60,6 +71,7 @@ async def test_post_query_streams_sse_events(client, monkeypatch):
         yield {"type": "status", "stage": "guardrails", "ok": True}
         yield {"type": "done", "answer": "hi", "chunk_ids": [], "doc_ids": []}
 
+    monkeypatch.setattr("app.api.routes_query.get_feature_flags", stub_get_feature_flags)
     monkeypatch.setattr("app.api.routes_query.run_query", stub_run_query)
     token = create_access_token(sub="user-1", org_id="org-1")
 
@@ -78,7 +90,8 @@ async def test_post_query_streams_sse_events(client, monkeypatch):
     assert captured["query"] == "what is rbac?"
     assert captured["org_id"] == "org-1"
     assert captured["user_ids"] == ["user-1"]
-    assert captured["feature_flags"] == {"cache.enabled": True, "faithfulness.enabled": True}
+    # live flags from the provider flow verbatim into run_query
+    assert captured["feature_flags"] == stub_flags
     assert captured["trace_id"]  # fresh correlation id per request
     # rate limit is keyed to the user and checked before streaming
     assert limiter.calls == [("user:user-1", 30, 60)]
