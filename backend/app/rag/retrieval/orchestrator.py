@@ -109,8 +109,10 @@ async def run_query(
             break
 
     # enrich from Postgres — Qdrant payload carries only chunk_text_hash, never real text
-    resolved = await resolve_text_for_chunk_ids(chunk_ids[:8], org_id)
-    contexts = [{"id": r["id"], "text": r["text"]} for r in resolved]
+    resolved = await resolve_text_for_chunk_ids(chunk_ids, org_id)
+    # drop empty/whitespace-only chunk texts before the budget so all-empty docs
+    # fall through to the empty-contexts refusal instead of reaching generation
+    contexts = [{"id": r["id"], "text": r["text"]} for r in resolved if r["text"].strip()]
 
     # configurable context budget before generation
     contexts = truncate_contexts(contexts, settings.max_context_tokens)
@@ -151,7 +153,10 @@ async def run_query(
         yield {"type": "output_warning", "warnings": warnings}
 
     chunk_ids = [c["id"] for c in contexts]
-    doc_ids = list({doc_by_chunk[c["id"]] for c in contexts if c["id"] in doc_by_chunk})
+    # insertion-ordered dedup keeps the SSE payload deterministic
+    doc_ids = list(
+        dict.fromkeys(doc_by_chunk[c["id"]] for c in contexts if c["id"] in doc_by_chunk)
+    )
     if cache_on:
         try:
             await set_cached(

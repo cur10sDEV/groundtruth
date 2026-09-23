@@ -405,6 +405,36 @@ async def test_set_cached_failure_does_not_break_the_stream(monkeypatch, caplog)
     assert any("cache write failed" in rec.getMessage() for rec in caplog.records)
 
 
+async def test_empty_resolved_texts_filtered_before_generation(monkeypatch):
+    h = Harness()
+    h.retriever.chunks = [chunk("c1", "d1"), chunk("c2", "d2"), chunk("c3", "d3")]
+    h.resolve.texts_by_id = {"c1": "", "c2": "   ", "c3": "real text"}
+    h.install(monkeypatch)
+
+    events = await h.run()
+
+    assert events[4] == {"type": "status", "stage": "retrieve", "count": 1}
+    assert h.generate.calls[0]["contexts"] == [{"id": "c3", "text": "real text"}]
+    done = events[-1]
+    assert done["chunk_ids"] == ["c3"]
+    assert done["doc_ids"] == ["d3"]
+
+
+async def test_all_resolved_texts_empty_yields_refusal(monkeypatch):
+    h = Harness()
+    h.retriever.chunks = [chunk("c1", "d1"), chunk("c2", "d2")]
+    h.resolve.texts_by_id = {"c1": "", "c2": "  "}
+    h.install(monkeypatch)
+
+    events = await h.run()
+
+    assert events[4] == {"type": "status", "stage": "retrieve", "count": 0}
+    assert events[5] == {"type": "done", "answer": REFUSAL, "chunk_ids": [], "doc_ids": []}
+    assert h.generate.calls == []
+    assert h.faithfulness.calls == []
+    assert h.cache.set_calls == []
+
+
 async def test_masked_query_flows_to_all_downstream_stages(monkeypatch):
     h = Harness()
     h.rewrite = StubRewrite()  # echo: retrieval runs on the masked query verbatim
