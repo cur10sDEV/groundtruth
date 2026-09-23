@@ -1,8 +1,12 @@
 from fastapi import Depends, Request
+from sqlalchemy import select
 
 from app.auth.security import decode_token
-from app.core.errors import AuthenticationError
-from app.models.organization import Role
+from app.core.errors import AuthenticationError, AuthorizationError
+from app.db import get_session
+from app.models.organization import Membership, Role
+
+_ROLE_RANK = {Role.MEMBER: 0, Role.ADMIN: 1, Role.OWNER: 2}
 
 
 def get_current_user(request: Request) -> dict:
@@ -15,7 +19,25 @@ def get_current_user(request: Request) -> dict:
 
 def require_member(role: Role | None = None):
     async def _dep(user: dict = Depends(get_current_user)) -> dict:
-        # role check resolved against membership table in Task 4.5; v1 trusts token org_id
+        if role is None:
+            return user
+        async with get_session() as session:
+            membership = (
+                (
+                    await session.execute(
+                        select(Membership).where(
+                            Membership.user_id == user["user_id"],
+                            Membership.org_id == user["org_id"],
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+        if membership is None:
+            raise AuthorizationError(detail="no membership in organization")
+        if _ROLE_RANK[membership.role] < _ROLE_RANK[role]:
+            raise AuthorizationError(detail="insufficient role")
         return user
 
     return _dep

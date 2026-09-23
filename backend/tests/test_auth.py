@@ -3,12 +3,14 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 import app.db as db_module
+from app.auth.dependencies import require_member
 from app.auth.security import (
     create_access_token,
     decode_token,
     hash_password,
     verify_password,
 )
+from app.core.errors import AuthorizationError
 from app.db import init_db
 from app.main import create_app
 from app.models.organization import Membership, Role
@@ -227,3 +229,78 @@ async def test_invite_duplicate_membership_rejected(client: AsyncClient):
     )
     assert second.status_code == 422
     assert second.json()["error"] == "already a member"
+
+
+async def _seed_membership(user_id: str, org_id: str, role: Role) -> None:
+    from app.models.organization import Organization
+
+    async with db_module.get_session() as session:
+        if await session.get(Organization, org_id) is None:
+            session.add(Organization(id=org_id, name=f"org-{org_id}"))
+        if await session.get(User, user_id) is None:
+            session.add(User(id=user_id, email=f"{user_id}@example.com", password_hash="x"))
+        session.add(Membership(user_id=user_id, org_id=org_id, role=role))
+        await session.commit()
+
+
+async def test_require_member_owner_required_checks_membership_db(client: AsyncClient):
+    await _seed_membership("u-owner", "org-1", Role.OWNER)
+    await _seed_membership("u-member", "org-1", Role.MEMBER)
+
+    dep = require_member(Role.OWNER)
+    assert await dep(user={"user_id": "u-owner", "org_id": "org-1"}) == {
+        "user_id": "u-owner",
+        "org_id": "org-1",
+    }
+    with pytest.raises(AuthorizationError):
+        await dep(user={"user_id": "u-member", "org_id": "org-1"})
+    with pytest.raises(AuthorizationError):
+        await dep(user={"user_id": "u-owner", "org_id": "org-without-membership"})
+
+
+async def test_require_member_member_required_accepts_all_roles(client: AsyncClient):
+    await _seed_membership("u-owner", "org-1", Role.OWNER)
+    await _seed_membership("u-admin", "org-1", Role.ADMIN)
+    await _seed_membership("u-member", "org-1", Role.MEMBER)
+
+    dep = require_member(Role.MEMBER)
+    for user_id in ("u-owner", "u-admin", "u-member"):
+        assert await dep(user={"user_id": user_id, "org_id": "org-1"}) == {
+            "user_id": user_id,
+            "org_id": "org-1",
+        }
+    with pytest.raises(AuthorizationError):
+        await dep(user={"user_id": "u-outsider", "org_id": "org-1"})
+
+
+async def test_require_member_no_role_only_requires_authentication(client: AsyncClient):
+    dep = require_member(None)
+    assert await dep(user={"user_id": "u-anyone", "org_id": "org-anywhere"}) == {
+        "user_id": "u-anyone",
+        "org_id": "org-anywhere",
+    }
+
+
+async def test_invite_denied_without_membership_in_token_org(client: AsyncClient):
+    alice = await _signup(client, "real-owner@example.com", "pw-secret")
+    bob = await _signup(client, "outsider@example.com", "pw-secret")
+
+    # validly-signed token, but bob has no membership row in alice's org
+    forged = create_access_token(sub=bob["user_id"], org_id=alice["org_id"])
+    resp = await client.post(
+        "/auth/invite",
+        json={"email": "someone@example.com", "role": "member"},
+        headers=await _auth_headers(forged),
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"] == "no membership in organization"
+
+    # alice (OWNER of that org) is still allowed
+    target = await _signup(client, "someone@example.com", "pw-secret")
+    ok = await client.post(
+        "/auth/invite",
+        json={"email": "someone@example.com", "role": "member"},
+        headers=await _auth_headers(alice["token"]),
+    )
+    assert ok.status_code == 200
+    assert ok.json()["user_id"] == target["user_id"]

@@ -18,6 +18,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
     from app.api.routes_auth import router as auth_router
+    from app.api.routes_documents import router as documents_router
     from app.api.routes_health import router as health_router
     from app.api.routes_query import router as query_router
     from app.ingestion.minio_webhook import register_minio_webhook
@@ -25,6 +26,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(auth_router)
     app.include_router(query_router)
+    app.include_router(documents_router)
     register_minio_webhook(app)
     register_exception_handlers(app)
     return app
