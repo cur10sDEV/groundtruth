@@ -63,6 +63,21 @@ async def run_query(
         }
         return
 
+    # optional model-based guard gate (feature-flagged)
+    if flags.get("guard_model.enabled", False) and settings.guard_model:
+        from app.rag.guardrails.model_guard import model_guard
+
+        fired, refusal = await model_guard(cleaned)
+        if fired:
+            yield {"type": "status", "stage": "guard_model", "ok": False}
+            yield {
+                "type": "done",
+                "answer": refusal or "Query blocked.",
+                "chunk_ids": [],
+                "doc_ids": [],
+            }
+            return
+
     # semantic cache — any cache failure (embedding/LLM/Redis) degrades to skip-cache
     cache_on = flags.get("cache.enabled", True)
     cached: CachedEntry | None = None
