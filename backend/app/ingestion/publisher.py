@@ -26,5 +26,8 @@ async def publish_message(payload: dict, routing_key: str = QUEUE) -> None:
         await connection.close()
 
 
-async def publish_ingestion(doc_id: str, s3_key: str) -> None:
-    await publish_message({"doc_id": doc_id, "s3_key": s3_key})
+async def publish_ingestion(doc_id: str, s3_key: str, new_version: int | None = None) -> None:
+    payload: dict = {"doc_id": doc_id, "s3_key": s3_key}
+    if new_version is not None:
+        payload["new_version"] = new_version
+    await publish_message(payload)

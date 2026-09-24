@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from app.db import get_session
 from app.models.chunk import Chunk
@@ -12,12 +12,17 @@ logger = logging.getLogger(__name__)
 
 
 async def find_stale_doc_ids(limit: int = 100) -> list[str]:
+    """Doc ids having ANY chunk older than the doc's current_version.
+
+    A doc that already serves the new version but still holds old-version
+    chunks (mixed window before cleanup) must be returned too.
+    """
     async with get_session() as session:
         rows = await session.execute(
-            select(Chunk.doc_id, func.max(Chunk.version).label("maxv"))
+            select(Chunk.doc_id)
             .join(Document, Document.id == Chunk.doc_id)
-            .group_by(Chunk.doc_id)
-            .having(func.max(Chunk.version) < Document.current_version)
+            .where(Chunk.version < Document.current_version)
+            .distinct()
             .limit(limit)
         )
         return [r.doc_id for r in rows]

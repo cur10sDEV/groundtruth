@@ -136,6 +136,40 @@ async def test_publish_ingestion_publishes_wrapped_message_to_queue(monkeypatch)
     assert json.loads(message.body) == {"doc_id": DOC_ID, "s3_key": S3_KEY}
 
 
+async def test_publish_ingestion_carries_new_version_when_given(monkeypatch):
+    state = {"published": []}
+
+    class _Exchange:
+        async def publish(self, message, routing_key):
+            state["published"].append((message, routing_key))
+
+    class _Channel:
+        def __init__(self):
+            self.default_exchange = _Exchange()
+
+    class _Connection:
+        async def channel(self):
+            return _Channel()
+
+        async def close(self):
+            pass
+
+    async def fake_connect(url):
+        return _Connection()
+
+    async def fake_declare(channel):
+        pass
+
+    monkeypatch.setattr(publisher_module, "connect_robust", fake_connect)
+    monkeypatch.setattr(publisher_module, "declare", fake_declare)
+
+    await publish_ingestion(DOC_ID, S3_KEY, new_version=2)
+
+    [(message, routing_key)] = state["published"]
+    assert routing_key == consumer.QUEUE
+    assert json.loads(message.body) == {"doc_id": DOC_ID, "s3_key": S3_KEY, "new_version": 2}
+
+
 async def test_cancel_document_version_scoped_cleanup_preserves_previous_version(db, monkeypatch):
     chunk_v1 = await _seed_chunk(DOC_ID, version=1)
     await _seed_chunk(DOC_ID, version=2)
@@ -382,7 +416,8 @@ async def test_find_stale_doc_ids_returns_docs_with_stale_chunks(db):
     await _seed_doc(DOC_C, current_version=1)
     await _seed_chunk(DOC_C, version=1)
 
-    assert await cleanup_module.find_stale_doc_ids() == [DOC_B]
+    # DOC_A keeps serving v2 but still has a stale v1 chunk pending cleanup
+    assert set(await cleanup_module.find_stale_doc_ids()) == {DOC_A, DOC_B}
 
 
 async def test_cleanup_job_loop_cleans_stale_docs(monkeypatch):

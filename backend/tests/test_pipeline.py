@@ -484,6 +484,44 @@ async def test_ingest_versioned_failure_keeps_current_version(
     assert fake_cache == []
 
 
+async def test_versioned_flip_keeps_v1_serving_until_flip(
+    db, fake_s3, fake_qdrant, fake_embeddings, fake_cache, monkeypatch
+):
+    from app.rag.retrieval.orchestrator import resolve_text_for_chunk_ids
+
+    fake_s3[S3_KEY] = b"Version two content with fresh words."
+    await _seed_doc(current_version=1)
+    async with get_session() as session:
+        doc = await session.get(Document, DOC_ID)
+        doc.status = DocumentStatus.EMBEDDED
+        await session.commit()
+    v1_id = await _seed_chunk(version=1, text="v1 body")
+
+    # pre-flip: v1 is the current version and serves
+    assert await resolve_text_for_chunk_ids([v1_id], ORG_ID) == [{"id": v1_id, "text": "v1 body"}]
+
+    served_mid_ingest = []
+
+    async def spying_dense_embed(texts):
+        # mid-ingest: v2 chunks are not committed and the flip is not applied,
+        # so retrieval-side resolution must still serve v1
+        served_mid_ingest.append(await resolve_text_for_chunk_ids([v1_id], ORG_ID))
+        return [[float(len(t)), 1.0] for t in texts]
+
+    monkeypatch.setattr(pipeline, "dense_embed", spying_dense_embed)
+
+    await ingest_versioned(DOC_ID, S3_KEY, 2)
+
+    assert served_mid_ingest == [[{"id": v1_id, "text": "v1 body"}]]
+
+    # post-flip: v1 is stale (mixed window until cleanup) and must not serve
+    assert await resolve_text_for_chunk_ids([v1_id], ORG_ID) == []
+    v2_ids = [r.id for r in await _chunks_for() if r.version == 2]
+    assert v2_ids
+    resolved_v2 = await resolve_text_for_chunk_ids(v2_ids, ORG_ID)
+    assert {r["id"] for r in resolved_v2} == set(v2_ids)
+
+
 async def test_cleanup_stale_deletes_old_versions(db, fake_qdrant):
     await _seed_doc(current_version=2)
     stale_id = await _seed_chunk(version=1, text="old text")

@@ -1,12 +1,13 @@
 import asyncio
 
 from app.core.logging import setup_logging
+from app.ingestion.cleanup_job import cleanup_job_loop
 from app.ingestion.consumer import consume_loop
 
 
 async def main() -> None:
     setup_logging()
-    await consume_loop()
+    await asyncio.gather(consume_loop(), cleanup_job_loop())
 
 
 def run_worker() -> None:

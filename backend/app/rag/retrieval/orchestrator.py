@@ -9,6 +9,7 @@ from app.core.telemetry import ensure_trace, trace_step
 from app.db import get_sessionmaker
 from app.models.chunk import Chunk
 from app.models.citation import Citation
+from app.models.document import Document
 from app.models.query_log import QueryLog
 from app.rag.guardrails.rules import run_guardrails, validate_output
 from app.rag.retrieval.cache import CachedEntry, get_cached, set_cached
@@ -29,8 +30,15 @@ async def resolve_text_for_chunk_ids(chunk_ids: list[str], org_id: str) -> list[
     async with sm() as session:
         rows = (
             await session.execute(
-                select(Chunk.id, Chunk.chunk_text).where(
-                    Chunk.id.in_(chunk_ids), Chunk.org_id == org_id
+                select(Chunk.id, Chunk.chunk_text)
+                .join(Document, Document.id == Chunk.doc_id)
+                .where(
+                    Chunk.id.in_(chunk_ids),
+                    Chunk.org_id == org_id,
+                    # version filter: during the mixed window between a version flip
+                    # and the cleanup job, stale chunks must never reach generation.
+                    # Exact match keeps v1 serving until the flip and v2 after it.
+                    Chunk.version == Document.current_version,
                 )
             )
         ).all()

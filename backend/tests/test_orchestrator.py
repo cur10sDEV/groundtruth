@@ -594,6 +594,19 @@ async def test_resolve_text_drops_vanished_chunk_ids(db):
     assert resolved == [{"id": a["chunk_id"], "text": "gamma chunk body"}]
 
 
+async def test_resolve_text_drops_stale_version_chunks_in_mixed_window(db):
+    a = await _seed_org_chunk(db, "delta", "delta chunk body")
+
+    # simulate the post-flip, pre-cleanup window: doc now serves v2 while the
+    # retrieved chunk is still v1 — it must not reach generation
+    async with db.get_session() as session:
+        doc = await session.get(Document, a["doc_id"])
+        doc.current_version = 2
+        await session.commit()
+
+    assert await resolve_text_for_chunk_ids([a["chunk_id"]], a["org_id"]) == []
+
+
 async def test_resolve_text_empty_input_short_circuits():
     assert await resolve_text_for_chunk_ids([], "org-1") == []
 

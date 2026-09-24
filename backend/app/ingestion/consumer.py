@@ -8,7 +8,7 @@ from app.core.config import get_settings
 from app.core.errors import IngestionError
 from app.db import get_session
 from app.models.document import Document, DocumentStatus
-from app.rag.ingestion.pipeline import ingest_document
+from app.rag.ingestion.pipeline import ingest_document, ingest_versioned
 
 logger = logging.getLogger(__name__)
 QUEUE = "ingestion"
@@ -54,16 +54,31 @@ async def process_message(body: dict) -> None:
     s3_key = body.get("s3_key")
     if not s3_key:
         raise IngestionError(detail="message missing s3_key")
+    new_version = body.get("new_version")
+    if new_version is not None and (
+        isinstance(new_version, bool) or not isinstance(new_version, int) or new_version < 1
+    ):
+        raise IngestionError(detail=f"invalid new_version: {new_version}")
     async with get_session() as session:
         doc = await session.get(Document, doc_id)
         if doc is None:
             raise IngestionError(detail=f"unknown doc {doc_id}")
-        if doc.status == DocumentStatus.EMBEDDED:
-            return
-        if doc.status == DocumentStatus.FAILED:
-            logger.info("skipping cancelled document", extra={"doc_id": doc_id})
-            return
-    await ingest_document(doc_id, s3_key)
+        if new_version is not None:
+            # Versioned re-ingest is also the recovery path for a previous FAILED
+            # attempt, so a FAILED doc proceeds. Skip only when the flip already
+            # happened (at-least-once redelivery after success).
+            if doc.current_version >= new_version:
+                return
+        else:
+            if doc.status == DocumentStatus.EMBEDDED:
+                return
+            if doc.status == DocumentStatus.FAILED:
+                logger.info("skipping cancelled document", extra={"doc_id": doc_id})
+                return
+    if new_version is not None:
+        await ingest_versioned(doc_id, s3_key, new_version)
+    else:
+        await ingest_document(doc_id, s3_key)
 
 
 def _retry_count(message: AbstractIncomingMessage) -> int:

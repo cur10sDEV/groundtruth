@@ -43,10 +43,43 @@ async def upload_document(
         if existing and existing.status == DocumentStatus.EMBEDDED:
             return {"doc_id": existing.id, "status": "duplicate", "already_embedded": True}
 
+        filename = file.filename or "untitled"
+        # same-filename re-upload for an already-EMBEDDED doc → new version of that doc
+        versioned = (
+            (
+                await session.execute(
+                    select(Document)
+                    .where(
+                        Document.org_id == user["org_id"],
+                        Document.user_id == user["user_id"],
+                        Document.original_filename == filename,
+                        Document.status == DocumentStatus.EMBEDDED,
+                    )
+                    .order_by(Document.created_at.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if versioned is not None:
+            new_version = versioned.current_version + 1
+            versioned.status = DocumentStatus.PENDING
+            versioned.pending_version = new_version
+            await session.commit()
+
+            s3_key = put_object(user["org_id"], user["user_id"], versioned.id, filename, data)
+            await publish_ingestion(versioned.id, s3_key, new_version=new_version)
+            return {
+                "doc_id": versioned.id,
+                "status": "processing",
+                "s3_key": s3_key,
+                "new_version": new_version,
+            }
+
         doc = Document(
             user_id=user["user_id"],
             org_id=user["org_id"],
-            original_filename=file.filename or "untitled",
+            original_filename=filename,
             status=DocumentStatus.PENDING,
             content_hash=content_hash,
             current_version=1,
@@ -54,9 +87,7 @@ async def upload_document(
         session.add(doc)
         await session.commit()
 
-        s3_key = put_object(
-            user["org_id"], user["user_id"], doc.id, file.filename or "untitled", data
-        )
+        s3_key = put_object(user["org_id"], user["user_id"], doc.id, filename, data)
         await publish_ingestion(doc.id, s3_key)
         return {"doc_id": doc.id, "status": "processing", "s3_key": s3_key}
 

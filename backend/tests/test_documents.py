@@ -252,6 +252,114 @@ async def test_upload_same_hash_other_org_is_not_duplicate(client, monkeypatch):
         assert doc.org_id == "org-1"
 
 
+async def test_upload_same_filename_embedded_doc_becomes_new_version(client, monkeypatch):
+    await _seed(
+        _org("org-1"),
+        _user("user-1"),
+        _doc("doc-v1", "org-1", "user-1", DocumentStatus.EMBEDDED, version=1),
+    )
+    s3_calls: list = []
+    events: list = []
+
+    def fake_put_object(org_id, user_id, doc_id, filename, data):
+        s3_calls.append((org_id, user_id, doc_id, filename, data))
+        return f"documents/{org_id}/{user_id}/{doc_id}/uuid.txt"
+
+    async def fake_publish(doc_id, s3_key, new_version=None):
+        events.append((doc_id, s3_key, new_version))
+
+    monkeypatch.setattr("app.api.routes_documents.put_object", fake_put_object)
+    monkeypatch.setattr("app.api.routes_documents.publish_ingestion", fake_publish)
+
+    token = create_access_token(sub="user-1", org_id="org-1")
+    resp = await client.post(
+        "/documents/upload",
+        files={"file": ("doc-v1.txt", b"fresh v2 bytes", "text/plain")},
+        headers=_auth(token),
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "doc_id": "doc-v1",
+        "status": "processing",
+        "s3_key": "documents/org-1/user-1/doc-v1/uuid.txt",
+        "new_version": 2,
+    }
+    async with db_module.get_session() as session:
+        doc = await session.get(Document, "doc-v1")
+        assert doc.status == DocumentStatus.PENDING
+        assert doc.pending_version == 2
+        assert doc.current_version == 1
+        rows = (await session.execute(select(Document))).scalars().all()
+        assert [d.id for d in rows] == ["doc-v1"]  # no new row for a versioned upload
+    assert events == [("doc-v1", "documents/org-1/user-1/doc-v1/uuid.txt", 2)]
+
+
+async def test_upload_same_filename_failed_doc_creates_new_document(client, monkeypatch):
+    await _seed(
+        _org("org-1"),
+        _user("user-1"),
+        _doc("doc-failed", "org-1", "user-1", DocumentStatus.FAILED, version=1),
+    )
+    events: list = []
+
+    def fake_put_object(org_id, user_id, doc_id, filename, data):
+        return f"documents/{org_id}/{user_id}/{doc_id}/uuid.txt"
+
+    async def fake_publish(doc_id, s3_key, new_version=None):
+        events.append((doc_id, s3_key, new_version))
+
+    monkeypatch.setattr("app.api.routes_documents.put_object", fake_put_object)
+    monkeypatch.setattr("app.api.routes_documents.publish_ingestion", fake_publish)
+
+    token = create_access_token(sub="user-1", org_id="org-1")
+    resp = await client.post(
+        "/documents/upload",
+        files={"file": ("doc-failed.txt", b"retry bytes", "text/plain")},
+        headers=_auth(token),
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["doc_id"] != "doc-failed"
+    assert "new_version" not in body
+    assert events == [(body["doc_id"], body["s3_key"], None)]
+    async with db_module.get_session() as session:
+        failed = await session.get(Document, "doc-failed")
+        assert failed.status == DocumentStatus.FAILED  # untouched
+
+
+async def test_upload_same_filename_other_user_not_versioned(client, monkeypatch):
+    await _seed(
+        _org("org-1"),
+        _user("user-1"),
+        _user("user-2"),
+        _doc("doc-colleague", "org-1", "user-2", DocumentStatus.EMBEDDED, version=1),
+    )
+    events: list = []
+
+    def fake_put_object(org_id, user_id, doc_id, filename, data):
+        return f"documents/{org_id}/{user_id}/{doc_id}/uuid.txt"
+
+    async def fake_publish(doc_id, s3_key, new_version=None):
+        events.append((doc_id, s3_key, new_version))
+
+    monkeypatch.setattr("app.api.routes_documents.put_object", fake_put_object)
+    monkeypatch.setattr("app.api.routes_documents.publish_ingestion", fake_publish)
+
+    token = create_access_token(sub="user-1", org_id="org-1")
+    resp = await client.post(
+        "/documents/upload",
+        files={"file": ("doc-colleague.txt", b"my own bytes", "text/plain")},
+        headers=_auth(token),
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["doc_id"] != "doc-colleague"
+    assert "new_version" not in body
+
+
 async def test_upload_requires_auth(client):
     resp = await client.post("/documents/upload", files={"file": ("a.txt", b"x", "text/plain")})
     assert resp.status_code == 401
