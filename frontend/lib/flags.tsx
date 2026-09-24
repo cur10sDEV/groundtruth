@@ -59,7 +59,9 @@ export function FlagsmithProvider({ children }: { children: ReactNode }) {
         .init({
           environmentID: environmentKey,
           api: process.env.NEXT_PUBLIC_FLAGSMITH_API_URL || undefined,
-          realtime: true,
+          // realtime only when an explicit SSE endpoint is configured
+          realtime: Boolean(process.env.NEXT_PUBLIC_FLAGSMITH_REALTIME_URL),
+          eventSourceUrl: process.env.NEXT_PUBLIC_FLAGSMITH_REALTIME_URL || undefined,
           onChange: update,
         })
         .then(update)

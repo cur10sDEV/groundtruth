@@ -12,6 +12,11 @@ GUARDRAIL_SAMPLES = [
     {"input": "what is the refund policy for electronics?", "expected_blocked": False},
     {"input": "how do I update my shipping address?", "expected_blocked": False},
     {"input": "what documents are available to me?", "expected_blocked": False},
+    # "blueprint" must not match the "print ... system prompt" injection pattern
+    {
+        "input": "Explain the blueprint system prompt section of the design doc.",
+        "expected_blocked": False,
+    },
 ]
 
 
