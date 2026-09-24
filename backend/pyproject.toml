@@ -12,7 +12,6 @@ dependencies = [
     "qdrant-client>=1.12",
     "boto3>=1.35",
     "redis>=5.2",
-    "redisvl>=0.3",
     "aio-pika>=9.4",
     "litellm>=1.53",
     "fastembed>=0.4",

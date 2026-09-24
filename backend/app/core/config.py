@@ -73,7 +73,6 @@ class Settings(BaseSettings):
 
     # Optional dedicated guard model (feature-flagged; empty disables)
     guard_model: str = ""
-    guard_model_enabled: bool = False
 
 
 @lru_cache
