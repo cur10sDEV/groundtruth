@@ -97,6 +97,34 @@ async def test_process_message_calls_ingest_document(monkeypatch):
     assert calls == [(DOC_ID, S3_KEY)]
 
 
+async def test_process_message_s3_key_owner_mismatch_raises(monkeypatch):
+    _patch_session(monkeypatch, _doc(DocumentStatus.PENDING))
+    calls = []
+
+    async def must_not_ingest(doc_id, s3_key):
+        calls.append(doc_id)
+        raise AssertionError("cross-tenant key must never be ingested")
+
+    monkeypatch.setattr(consumer, "ingest_document", must_not_ingest)
+
+    bad_key = f"documents/other-org/{USER_ID}/{DOC_ID}/sample.txt"
+    with pytest.raises(IngestionError) as excinfo:
+        await process_message({"doc_id": DOC_ID, "s3_key": bad_key})
+    assert "does not match document owner" in excinfo.value.detail
+
+    bad_key = f"documents/{ORG_ID}/other-user/{DOC_ID}/sample.txt"
+    with pytest.raises(IngestionError):
+        await process_message({"doc_id": DOC_ID, "s3_key": bad_key})
+    assert calls == []
+
+
+async def test_process_message_malformed_s3_key_raises(monkeypatch):
+    _patch_session(monkeypatch, _doc(DocumentStatus.PENDING))
+    with pytest.raises(IngestionError) as excinfo:
+        await process_message({"doc_id": DOC_ID, "s3_key": "not-a-valid-key"})
+    assert "malformed s3 key" in excinfo.value.detail
+
+
 async def test_process_message_versioned_routes_to_ingest_versioned(monkeypatch):
     _patch_session(monkeypatch, _doc(DocumentStatus.PENDING, current_version=1))
     calls = []

@@ -3,15 +3,24 @@ from urllib.parse import unquote
 
 from fastapi import APIRouter, FastAPI, Request
 
-from app.core.errors import IngestionError
+from app.core.config import get_settings
+from app.core.errors import AuthenticationError, IngestionError
 from app.ingestion.publisher import publish_ingestion
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+WEBHOOK_SECRET_HEADER = "X-Webhook-Secret"
+
 
 @router.post("/internal/minio-event")
 async def minio_event(request: Request) -> dict:
+    settings = get_settings()
+    provided = request.headers.get(WEBHOOK_SECRET_HEADER)
+    # Unset secret disables the endpoint entirely (direct publish is canonical);
+    # a configured secret must be presented and match exactly.
+    if not settings.webhook_secret or provided != settings.webhook_secret:
+        raise AuthenticationError(detail="invalid or missing webhook secret")
     data = await request.json()
     for record in data.get("Records", []):
         if "ObjectRemoved" in record.get("eventName", ""):

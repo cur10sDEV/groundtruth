@@ -6,6 +6,7 @@ from aio_pika.abc import AbstractChannel, AbstractIncomingMessage
 
 from app.core.config import get_settings
 from app.core.errors import IngestionError
+from app.core.s3 import key_to_parts
 from app.db import get_session
 from app.models.document import Document, DocumentStatus
 from app.rag.ingestion.pipeline import ingest_document, ingest_versioned
@@ -63,6 +64,14 @@ async def process_message(body: dict) -> None:
         doc = await session.get(Document, doc_id)
         if doc is None:
             raise IngestionError(detail=f"unknown doc {doc_id}")
+        # cross-tenant seam: the s3 key's org/user segments must match the
+        # document owner or the message is poisoned → DLQ, never ingest
+        try:
+            key_org, key_user, _, _ = key_to_parts(s3_key)
+        except ValueError as exc:
+            raise IngestionError(detail=f"malformed s3 key: {s3_key}") from exc
+        if key_org != doc.org_id or key_user != doc.user_id:
+            raise IngestionError(detail=f"s3 key does not match document owner: {s3_key}")
         if new_version is not None:
             # Versioned re-ingest is also the recovery path for a previous FAILED
             # attempt, so a FAILED doc proceeds. Skip only when the flip already

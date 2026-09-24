@@ -301,7 +301,9 @@ async def test_process_message_cancel_flag_short_circuits(monkeypatch):
 
 
 def _webhook_client(monkeypatch, published) -> TestClient:
-    async def fake_publish_ingestion(doc_id, s3_key):
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cr3t")
+
+    async def fake_publish_ingestion(doc_id, s3_key, new_version=None):
         published.append((doc_id, s3_key))
 
     monkeypatch.setattr(minio_webhook, "publish_ingestion", fake_publish_ingestion)
@@ -309,6 +311,10 @@ def _webhook_client(monkeypatch, published) -> TestClient:
     minio_webhook.register_minio_webhook(app)
     register_exception_handlers(app)
     return TestClient(app)
+
+
+def _webhook_headers(secret: str = "s3cr3t") -> dict:
+    return {"X-Webhook-Secret": secret}
 
 
 def test_minio_event_publishes_ingestion_for_each_record(monkeypatch):
@@ -324,11 +330,62 @@ def test_minio_event_publishes_ingestion_for_each_record(monkeypatch):
                 {"not": "an s3 record"},
             ]
         },
+        headers=_webhook_headers(),
     )
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
     assert published == [("doc-1", "documents/org-1/user-1/doc-1/abc.pdf")]
+
+
+def test_minio_event_rejects_missing_secret(monkeypatch):
+    published = []
+    client = _webhook_client(monkeypatch, published)
+
+    resp = client.post(
+        "/internal/minio-event",
+        json={"Records": [{"s3": {"object": {"key": "documents/o/u/d/abc.pdf"}}}]},
+    )
+
+    assert resp.status_code == 401
+    assert "webhook secret" in resp.json()["error"]
+    assert published == []
+
+
+def test_minio_event_rejects_wrong_secret(monkeypatch):
+    published = []
+    client = _webhook_client(monkeypatch, published)
+
+    resp = client.post(
+        "/internal/minio-event",
+        json={"Records": [{"s3": {"object": {"key": "documents/o/u/d/abc.pdf"}}}]},
+        headers=_webhook_headers("wrong"),
+    )
+
+    assert resp.status_code == 401
+    assert published == []
+
+
+def test_minio_event_unconfigured_secret_disables_endpoint(monkeypatch):
+    monkeypatch.delenv("WEBHOOK_SECRET", raising=False)
+
+    async def must_not_publish(*args, **kwargs):
+        raise AssertionError("unauthenticated webhook must not publish")
+
+    monkeypatch.setattr(minio_webhook, "publish_ingestion", must_not_publish)
+    app = FastAPI()
+    minio_webhook.register_minio_webhook(app)
+    register_exception_handlers(app)
+    client = TestClient(app)
+
+    # no secret configured: every caller is rejected, even one sending a header
+    for headers in (None, {"X-Webhook-Secret": ""}, {"X-Webhook-Secret": "guess"}):
+        resp = client.post(
+            "/internal/minio-event",
+            json={"Records": [{"s3": {"object": {"key": "documents/o/u/d/abc.pdf"}}}]},
+            headers=headers,
+        )
+        assert resp.status_code == 401
 
 
 def test_minio_event_rejects_unexpected_s3_key(monkeypatch):
@@ -338,6 +395,7 @@ def test_minio_event_rejects_unexpected_s3_key(monkeypatch):
     resp = client.post(
         "/internal/minio-event",
         json={"Records": [{"s3": {"object": {"key": "documents/short.pdf"}}}]},
+        headers=_webhook_headers(),
     )
 
     assert resp.status_code == 500
@@ -367,6 +425,7 @@ def test_minio_event_unquotes_url_encoded_s3_keys(monkeypatch):
                 }
             ],
         },
+        headers=_webhook_headers(),
     )
 
     assert resp.status_code == 200
@@ -391,6 +450,7 @@ def test_minio_event_ignores_object_removed_events(monkeypatch):
                 },
             ]
         },
+        headers=_webhook_headers(),
     )
 
     assert resp.status_code == 200
@@ -398,9 +458,10 @@ def test_minio_event_ignores_object_removed_events(monkeypatch):
     assert published == [("doc-2", "documents/org-1/user-1/doc-2/abc.pdf")]
 
 
-def test_minio_webhook_registered_on_production_app():
+def test_minio_webhook_registered_on_production_app(monkeypatch):
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cr3t")
     client = TestClient(create_app())
-    resp = client.post("/internal/minio-event", json={"Records": []})
+    resp = client.post("/internal/minio-event", json={"Records": []}, headers=_webhook_headers())
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
 
