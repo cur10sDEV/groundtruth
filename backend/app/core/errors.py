@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.core.logging import get_logger, new_correlation_id
+from app.core.logging import get_correlation_id, get_logger, new_correlation_id
 
 logger = get_logger(__name__)
 
@@ -63,7 +63,9 @@ class NotFoundError(DomainError):
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(DomainError)
     async def domain_error_handler(request: Request, exc: DomainError):
-        trace_id = new_correlation_id()
+        # reuse the request's correlation id when one is in scope (set by the
+        # query / webhook routes) instead of minting a fresh one
+        trace_id = get_correlation_id() or new_correlation_id()
         logger.error("domain error", extra={"correlation_id": trace_id})
         return JSONResponse(
             status_code=exc.status_code,

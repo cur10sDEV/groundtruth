@@ -5,6 +5,7 @@ from fastapi import APIRouter, FastAPI, Request
 
 from app.core.config import get_settings
 from app.core.errors import AuthenticationError, IngestionError
+from app.core.logging import new_correlation_id, set_correlation_id
 from app.ingestion.publisher import publish_ingestion
 
 logger = logging.getLogger(__name__)
@@ -15,6 +16,7 @@ WEBHOOK_SECRET_HEADER = "X-Webhook-Secret"
 
 @router.post("/internal/minio-event")
 async def minio_event(request: Request) -> dict:
+    set_correlation_id(new_correlation_id())
     settings = get_settings()
     provided = request.headers.get(WEBHOOK_SECRET_HEADER)
     # Unset secret disables the endpoint entirely (direct publish is canonical);

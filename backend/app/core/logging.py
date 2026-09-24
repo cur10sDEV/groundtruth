@@ -1,8 +1,21 @@
+import contextvars
 import json
 import logging
 import sys
 import time
 from uuid import uuid4
+
+correlation_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "correlation_id", default=None
+)
+
+
+def set_correlation_id(value: str | None) -> None:
+    correlation_id_var.set(value)
+
+
+def get_correlation_id() -> str | None:
+    return correlation_id_var.get()
 
 
 class JsonFormatter(logging.Formatter):
@@ -12,7 +25,7 @@ class JsonFormatter(logging.Formatter):
             "level": record.levelname,
             "logger": record.name,
             "msg": record.getMessage(),
-            "correlation_id": getattr(record, "correlation_id", None),
+            "correlation_id": getattr(record, "correlation_id", None) or correlation_id_var.get(),
         }
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)

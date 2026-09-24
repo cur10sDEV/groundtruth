@@ -10,6 +10,7 @@ from sqlalchemy import select
 import app.db as db_module
 from app.core.config import get_settings
 from app.core.errors import register_exception_handlers
+from app.core.logging import get_correlation_id
 from app.db import get_session, init_db
 from app.ingestion import cancel as cancel_module
 from app.ingestion import cleanup_job as cleanup_module
@@ -364,6 +365,30 @@ def test_minio_event_rejects_wrong_secret(monkeypatch):
 
     assert resp.status_code == 401
     assert published == []
+
+
+def test_minio_event_sets_correlation_id_for_request_logs(monkeypatch):
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cr3t")
+    seen = {}
+
+    async def fake_publish_ingestion(doc_id, s3_key, new_version=None):
+        seen["correlation_id"] = get_correlation_id()
+
+    monkeypatch.setattr(minio_webhook, "publish_ingestion", fake_publish_ingestion)
+    app = FastAPI()
+    minio_webhook.register_minio_webhook(app)
+    register_exception_handlers(app)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/internal/minio-event",
+        json={"Records": [{"s3": {"object": {"key": "documents/o/u/d/abc.pdf"}}}]},
+        headers={"X-Webhook-Secret": "s3cr3t"},
+    )
+
+    assert resp.status_code == 200
+    # every log/publish inside the webhook request shares one correlation id
+    assert seen["correlation_id"]
 
 
 def test_minio_event_unconfigured_secret_disables_endpoint(monkeypatch):

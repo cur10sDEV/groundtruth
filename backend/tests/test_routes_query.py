@@ -1,10 +1,12 @@
 import json
+import logging
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 import app.db as db_module
 from app.auth.security import create_access_token
+from app.core.logging import get_correlation_id
 from app.db import init_db
 from app.main import create_app
 from app.models.chunk import Chunk
@@ -12,6 +14,17 @@ from app.models.citation import Citation
 from app.models.document import Document, DocumentStatus
 from app.models.organization import Organization
 from app.models.user import User
+
+
+class _CorrelationSnapshotHandler(logging.Handler):
+    """Records the contextvar correlation id at emit time (request context)."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen: list[str | None] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.seen.append(get_correlation_id())
 
 
 class _StubLimiter:
@@ -95,6 +108,41 @@ async def test_post_query_streams_sse_events(client, monkeypatch):
     assert captured["trace_id"]  # fresh correlation id per request
     # rate limit is keyed to the user and checked before streaming
     assert limiter.calls == [("user:user-1", 30, 60)]
+
+
+async def stub_flags_off():
+    return {"cache.enabled": False}
+
+
+async def test_post_query_sets_correlation_id_for_stream_logs(client, monkeypatch):
+    c, _ = client
+    captured = {}
+
+    async def stub_run_query(query, org_id, user_ids, feature_flags, trace_id):
+        captured["trace_id"] = trace_id
+        captured["correlation_id_in_stage"] = get_correlation_id()
+        logging.getLogger("test.stage").warning("inside-stage")
+        yield {"type": "done", "answer": "hi", "chunk_ids": [], "doc_ids": []}
+
+    monkeypatch.setattr("app.api.routes_query.get_feature_flags", stub_flags_off)
+    monkeypatch.setattr("app.api.routes_query.run_query", stub_run_query)
+
+    snapshot_handler = _CorrelationSnapshotHandler()
+    root = logging.getLogger()
+    root.addHandler(snapshot_handler)
+    try:
+        token = create_access_token(sub="user-1", org_id="org-1")
+        resp = await c.post("/query", json={"query": "hi"}, headers=_auth(token))
+        assert resp.status_code == 200
+        assert "done" in resp.text  # consumes the stream so the stub generator runs
+    finally:
+        root.removeHandler(snapshot_handler)
+
+    # the route sets the contextvar to the trace id, visible to stage code
+    assert captured["correlation_id_in_stage"] == captured["trace_id"]
+    # log lines emitted inside the stream carry the same correlation id
+    assert snapshot_handler.seen
+    assert snapshot_handler.seen[-1] == captured["trace_id"]
 
 
 async def test_post_query_requires_auth(client):

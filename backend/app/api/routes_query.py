@@ -10,7 +10,7 @@ from app.auth.dependencies import get_current_user
 from app.core.config import get_settings
 from app.core.errors import RateLimitError, ValidationError
 from app.core.flags import get_feature_flags
-from app.core.logging import new_correlation_id
+from app.core.logging import new_correlation_id, set_correlation_id
 from app.core.redis_store import get_limiter
 from app.db import get_session
 from app.models.chunk import Chunk
@@ -45,6 +45,7 @@ async def query_endpoint(
         raise ValidationError(detail="query exceeds input token budget")
 
     trace_id = new_correlation_id()
+    set_correlation_id(trace_id)
 
     async def event_stream():
         feature_flags = await get_feature_flags()

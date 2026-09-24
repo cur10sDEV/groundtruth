@@ -6,6 +6,7 @@ from app.core.errors import (
     NotFoundError,
     register_exception_handlers,
 )
+from app.core.logging import set_correlation_id
 from app.main import create_app
 
 
@@ -44,3 +45,22 @@ def test_app_factory_returns_trace_id_json_for_domain_errors():
         body = resp.json()
         assert body["error"] == "missing"
         assert "trace_id" in body
+
+
+def test_domain_error_handler_reuses_request_correlation_id():
+    app = FastAPI()
+
+    async def boom() -> None:
+        set_correlation_id("req-trace-42")
+        raise NotFoundError(detail="missing")
+
+    app.add_api_route("/boom", boom)
+    register_exception_handlers(app)
+    client = TestClient(app)
+
+    resp = client.get("/boom")
+
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["trace_id"] == "req-trace-42"
+    set_correlation_id(None)
