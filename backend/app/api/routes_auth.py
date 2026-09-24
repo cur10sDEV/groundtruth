@@ -2,11 +2,12 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import select
 
-from app.auth.dependencies import get_current_user, require_member
+from app.auth.dependencies import ROLE_RANK, get_current_user, require_member
 from app.auth.security import create_access_token, hash_password, verify_password
 from app.core.config import get_settings
 from app.core.errors import (
     AuthenticationError,
+    AuthorizationError,
     NotFoundError,
     RateLimitError,
     ValidationError,
@@ -18,7 +19,7 @@ from app.models.user import User
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-_member_required = require_member(Role.MEMBER)
+_admin_required = require_member(Role.ADMIN)
 
 
 class SignupIn(BaseModel):
@@ -87,8 +88,25 @@ async def login(body: LoginIn) -> dict:
 
 
 @router.post("/invite")
-async def invite(body: InviteIn, user: dict = Depends(_member_required)) -> dict:
+async def invite(body: InviteIn, user: dict = Depends(_admin_required)) -> dict:
     async with get_session() as session:
+        inviter = (
+            (
+                await session.execute(
+                    select(Membership).where(
+                        Membership.user_id == user["user_id"],
+                        Membership.org_id == user["org_id"],
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if inviter is None:
+            raise AuthorizationError(detail="no membership in organization")
+        # requested role is capped at the inviter's own rank
+        if ROLE_RANK[inviter.role] < ROLE_RANK[body.role]:
+            raise AuthorizationError(detail="cannot invite a role above your own")
         target = (
             (await session.execute(select(User).where(User.email == body.email))).scalars().first()
         )

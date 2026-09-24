@@ -6,7 +6,7 @@ from app.core.errors import AuthenticationError, AuthorizationError
 from app.db import get_session
 from app.models.organization import Membership, Role
 
-_ROLE_RANK = {Role.MEMBER: 0, Role.ADMIN: 1, Role.OWNER: 2}
+ROLE_RANK = {Role.MEMBER: 0, Role.ADMIN: 1, Role.OWNER: 2}
 
 
 def get_current_user(request: Request) -> dict:
@@ -36,7 +36,7 @@ def require_member(role: Role | None = None):
             )
         if membership is None:
             raise AuthorizationError(detail="no membership in organization")
-        if _ROLE_RANK[membership.role] < _ROLE_RANK[role]:
+        if ROLE_RANK[membership.role] < ROLE_RANK[role]:
             raise AuthorizationError(detail="insufficient role")
         return user
 

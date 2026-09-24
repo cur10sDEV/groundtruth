@@ -304,3 +304,98 @@ async def test_invite_denied_without_membership_in_token_org(client: AsyncClient
     )
     assert ok.status_code == 200
     assert ok.json()["user_id"] == target["user_id"]
+
+
+async def test_invite_denied_for_member_role_inviter(client: AsyncClient):
+    # forged token: a plain MEMBER (even with a real membership row) cannot invite
+    alice = await _signup(client, "owner-m@example.com", "pw-secret")
+    carol = await _signup(client, "member-carol@example.com", "pw-secret")
+
+    await client.post(
+        "/auth/invite",
+        json={"email": "member-carol@example.com", "role": "member"},
+        headers=await _auth_headers(alice["token"]),
+    )
+    member_headers = await _auth_headers(
+        create_access_token(sub=carol["user_id"], org_id=alice["org_id"])
+    )
+
+    resp = await client.post(
+        "/auth/invite",
+        json={"email": "owner-m@example.com", "role": "member"},
+        headers=member_headers,
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"] == "insufficient role"
+
+
+async def test_invite_role_capped_at_inviter_rank(client: AsyncClient):
+    alice = await _signup(client, "rank-owner@example.com", "pw-secret")  # OWNER
+    dave = await _signup(client, "rank-dave@example.com", "pw-secret")  # becomes ADMIN
+    await _signup(client, "rank-erin@example.com", "pw-secret")
+    await _signup(client, "rank-frank@example.com", "pw-secret")
+    grace = await _signup(client, "rank-grace@example.com", "pw-secret")
+
+    # OWNER mints an ADMIN
+    promoted = await client.post(
+        "/auth/invite",
+        json={"email": "rank-dave@example.com", "role": "admin"},
+        headers=await _auth_headers(alice["token"]),
+    )
+    assert promoted.status_code == 200
+    assert promoted.json()["role"] == "admin"
+    # dave's signup token points at his own org (where he is OWNER); forge one
+    # for alice's org so his ADMIN rank there is what authorizes the invite
+    admin_headers = await _auth_headers(
+        create_access_token(sub=dave["user_id"], org_id=alice["org_id"])
+    )
+
+    # ADMIN can mint MEMBER and ADMIN ...
+    ok_member = await client.post(
+        "/auth/invite",
+        json={"email": "rank-erin@example.com", "role": "member"},
+        headers=admin_headers,
+    )
+    assert ok_member.status_code == 200
+
+    ok_admin = await client.post(
+        "/auth/invite",
+        json={"email": "rank-frank@example.com", "role": "admin"},
+        headers=admin_headers,
+    )
+    assert ok_admin.status_code == 200
+
+    # ... but never OWNER
+    forbidden = await client.post(
+        "/auth/invite",
+        json={"email": "rank-grace@example.com", "role": "owner"},
+        headers=admin_headers,
+    )
+    assert forbidden.status_code == 403
+    assert forbidden.json()["error"] == "cannot invite a role above your own"
+
+    async with db_module.get_session() as session:
+        memberships = (
+            (
+                await session.execute(
+                    select(Membership).where(Membership.user_id == grace["user_id"])
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [m.org_id for m in memberships] == [grace["org_id"]]  # only her own signup org
+
+
+async def test_invite_owner_can_mint_owner(client: AsyncClient):
+    alice = await _signup(client, "mint-owner@example.com", "pw-secret")
+    await _signup(client, "mint-zoe@example.com", "pw-secret")
+
+    resp = await client.post(
+        "/auth/invite",
+        json={"email": "mint-zoe@example.com", "role": "owner"},
+        headers=await _auth_headers(alice["token"]),
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["role"] == "owner"
