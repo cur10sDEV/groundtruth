@@ -1,0 +1,76 @@
+{
+  "title": "RAG Prod",
+  "uid": "rag-prod",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Requests/s",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "" },
+      "targets": [
+        { "expr": "rate(rag_requests_total[1m])", "refId": "A", "legendFormat": "requests" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "title": "Error rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "" },
+      "targets": [
+        { "expr": "rate(rag_errors_total[1m]) / rate(rag_requests_total[1m])", "refId": "A", "legendFormat": "errors / requests" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 }
+    },
+    {
+      "id": 3,
+      "title": "Latency p50/p95/p99",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "" },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(rag_latency_seconds_bucket[5m])))", "refId": "A", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(rag_latency_seconds_bucket[5m])))", "refId": "B", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(rag_latency_seconds_bucket[5m])))", "refId": "C", "legendFormat": "p99" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }
+    },
+    {
+      "id": 4,
+      "title": "Token usage",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "" },
+      "targets": [
+        { "expr": "rate(rag_tokens_in_total[5m])", "refId": "A", "legendFormat": "in" },
+        { "expr": "rate(rag_tokens_out_total[5m])", "refId": "B", "legendFormat": "out" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 }
+    },
+    {
+      "id": 5,
+      "title": "Cache hit/miss rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "" },
+      "targets": [
+        { "expr": "rate(rag_cache_hits_total[5m])", "refId": "A", "legendFormat": "hits" },
+        { "expr": "rate(rag_cache_misses_total[5m])", "refId": "B", "legendFormat": "misses" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 }
+    },
+    {
+      "id": 6,
+      "title": "Ingestion throughput",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "" },
+      "targets": [
+        { "expr": "rate(rag_ingestion_processed_total[5m])", "refId": "A", "legendFormat": "processed" },
+        { "expr": "rate(rag_ingestion_failed_total[5m])", "refId": "B", "legendFormat": "failed" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 }
+    }
+  ],
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "30s",
+  "schemaVersion": 39
+}

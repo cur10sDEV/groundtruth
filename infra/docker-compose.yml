@@ -120,6 +120,7 @@ services:
     volumes:
       - "./grafana/provisioning:/etc/grafana/provisioning"
       - "grafanadata:/var/lib/grafana"
+      - "./grafana/dashboards:/var/lib/grafana/dashboards"
     depends_on:
       - prometheus
 
