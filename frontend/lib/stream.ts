@@ -6,6 +6,7 @@ export type StreamEvent = {
     | "faithfulness"
     | "override"
     | "output_warning"
+    | "error" // mid-stream failure; the server follows with a refusal done
     | "done";
   [key: string]: any;
 };

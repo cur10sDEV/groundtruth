@@ -103,6 +103,34 @@ async def _log_query(
 async def run_query(
     query: str, org_id: str, user_ids: list[str], feature_flags: dict, trace_id: str
 ) -> AsyncIterator[dict]:
+    """Stream a full RAG query.
+
+    Any exception raised after streaming has begun degrades to an `error`
+    event (trace_id for support) followed by a refusal `done`, so the client
+    never sees an aborted connection mid-stream.
+    """
+    try:
+        async for ev in _run_query_stream(query, org_id, user_ids, feature_flags, trace_id):
+            yield ev
+    except Exception as exc:
+        logger.error(
+            "query failed mid-stream, emitting refusal",
+            extra={"trace_id": trace_id, "exc": str(exc)},
+            exc_info=True,
+        )
+        yield {"type": "error", "trace_id": trace_id}
+        yield {
+            "type": "done",
+            "answer": "I cannot confidently answer that based on the available documents.",
+            "chunk_ids": [],
+            "doc_ids": [],
+            "query_id": trace_id,
+        }
+
+
+async def _run_query_stream(
+    query: str, org_id: str, user_ids: list[str], feature_flags: dict, trace_id: str
+) -> AsyncIterator[dict]:
     settings = get_settings()
     flags = feature_flags
     root = ensure_trace(trace_id)

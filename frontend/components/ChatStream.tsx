@@ -39,6 +39,16 @@ export default function ChatStream() {
         });
       } else if (ev.type === "status") {
         setStage(String(ev.stage ?? ""));
+      } else if (ev.type === "error") {
+        // mid-stream backend failure: surface the trace id and finalize the bubble
+        const trace = String(ev.trace_id ?? "unknown");
+        acc += `${acc ? "\n\n" : ""}[error] something went wrong (trace: ${trace})`;
+        setMessages((m) => {
+          const next = [...m];
+          const last = next[next.length - 1];
+          last.content = acc;
+          return next;
+        });
       } else if (ev.type === "done") {
         setMessages((m) => {
           const next = [...m];

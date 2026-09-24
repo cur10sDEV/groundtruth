@@ -409,6 +409,52 @@ async def test_output_validation_masks_final_answer_and_warns(monkeypatch):
     assert h.cache.set_calls[0][2].answer == done["answer"]
 
 
+async def test_midstream_generate_failure_emits_error_then_refusal_done(monkeypatch):
+    h = Harness()
+    h.retriever.chunks = [chunk("c1", "d1")]
+    h.install(monkeypatch)
+
+    async def failing_generate(contexts, query):
+        yield {"type": "meta", "model_used": "stub/test-model"}
+        yield {"type": "token", "text": "partial answ"}
+        raise RuntimeError("llm exploded mid-stream")
+
+    monkeypatch.setattr(orch, "generate_answer", failing_generate)
+
+    events = await h.run()
+
+    # tokens streamed before the failure are preserved in the event stream
+    assert {"type": "token", "text": "partial answ"} in events
+    assert events[-2] == {"type": "error", "trace_id": "trace-1"}
+    assert events[-1] == {
+        "type": "done",
+        "answer": REFUSAL,
+        "chunk_ids": [],
+        "doc_ids": [],
+        "query_id": "trace-1",
+    }
+    # nothing is cached from a failed stream
+    assert h.cache.set_calls == []
+
+
+async def test_midstream_domain_error_emits_error_then_refusal_done(monkeypatch):
+    h = Harness()
+    h.retriever.chunks = [chunk("c1", "d1")]
+    h.install(monkeypatch)
+
+    async def failing_faithfulness(query, answer, contexts):
+        raise LLMError(detail="judge backend down")
+
+    monkeypatch.setattr(orch, "check_faithfulness", failing_faithfulness)
+
+    events = await h.run()
+
+    assert events[-2] == {"type": "error", "trace_id": "trace-1"}
+    assert events[-1]["type"] == "done"
+    assert events[-1]["answer"] == REFUSAL
+    assert events[-1]["query_id"] == "trace-1"
+
+
 async def test_get_cached_failure_degrades_to_cache_miss(monkeypatch, caplog):
     h = Harness()
     h.cache.raise_on_get = True
