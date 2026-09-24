@@ -4,7 +4,7 @@ import { useAuth } from "@/lib/auth";
 import { streamQuery, StreamEvent } from "@/lib/stream";
 import Message from "@/components/Message";
 
-type Msg = { role: "user" | "assistant"; content: string; docIds?: string[] };
+type Msg = { role: "user" | "assistant"; content: string; docIds?: string[]; queryId?: string };
 
 export default function ChatStream() {
   const { auth } = useAuth();
@@ -45,6 +45,7 @@ export default function ChatStream() {
           const last = next[next.length - 1];
           last.content = ev.answer ?? acc;
           last.docIds = ev.doc_ids ?? [];
+          last.queryId = ev.query_id;
           return next;
         });
       }
@@ -68,7 +69,14 @@ export default function ChatStream() {
     <div className="mx-auto flex h-screen max-w-3xl flex-col p-4">
       <div className="flex-1 space-y-3 overflow-y-auto">
         {messages.map((m, i) => (
-          <Message key={i} role={m.role} content={m.content} docIds={m.docIds} />
+          <Message
+            key={i}
+            role={m.role}
+            content={m.content}
+            docIds={m.docIds}
+            queryId={m.queryId}
+            token={auth?.token}
+          />
         ))}
       </div>
       {busy && stage ? (

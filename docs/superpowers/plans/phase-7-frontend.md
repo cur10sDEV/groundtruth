@@ -472,6 +472,7 @@ git commit -m "feat(frontend): add chat UI with SSE streaming"
   - `DocumentList`: `GET /documents`, polls every 5s until status is `EMBEDDED`/`FAILED`; shows
     filename, status, version; `DELETE` button.
   - Documents page linking to chat.
+  - Citations drill-down: on done, fetch GET /query/{query_id}/citations and render chunk texts.
 
 - [ ] **Step 1: Write UploadButton**
 

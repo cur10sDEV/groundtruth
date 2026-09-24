@@ -554,6 +554,8 @@ git commit -m "feat(rag): add grounded generation with citations and faithfulnes
   - `run_query` uses the **cleaned/masked query** (`run_guardrails().cleaned_text`) for downstream
     stages, **truncates contexts** to `settings.max_context_tokens`, and runs **output validation**
     (`validate_output`) on the final answer before emitting `done`.
+  - run_query also persists QueryLog (query_id=trace_id) + Citation rows for cited chunks and
+    includes `query_id` in every done event (log-write failures never break a query).
   - `router` in `routes_query.py`:
     - `POST /query` → auth + rate-limit + token-budget + guardrails; streams SSE via
       `StreamingResponse`.

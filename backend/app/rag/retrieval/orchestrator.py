@@ -8,6 +8,8 @@ from app.core.metrics import incr_cache, record_tokens
 from app.core.telemetry import ensure_trace, trace_step
 from app.db import get_sessionmaker
 from app.models.chunk import Chunk
+from app.models.citation import Citation
+from app.models.query_log import QueryLog
 from app.rag.guardrails.rules import run_guardrails, validate_output
 from app.rag.retrieval.cache import CachedEntry, get_cached, set_cached
 from app.rag.retrieval.faithfulness import check_faithfulness
@@ -40,6 +42,56 @@ async def resolve_text_for_chunk_ids(chunk_ids: list[str], org_id: str) -> list[
     ]
 
 
+async def _log_query(
+    trace_id: str,
+    user_ids: list[str],
+    org_id: str,
+    query_text: str,
+    cache_hit: bool,
+    chunk_ids: list[str],
+    doc_by_chunk: dict[str, str] | None = None,
+) -> None:
+    """Persist QueryLog + Citation rows for a finished query.
+
+    Fail-open by contract: any storage error is warned about and swallowed so
+    logging can never break a query. Chunks without a resolvable doc_id (RBAC
+    miss or vanished row) are skipped rather than risking the whole write.
+    """
+    try:
+        sm = get_sessionmaker()
+        async with sm() as session:
+            session.add(
+                QueryLog(
+                    query_id=trace_id,
+                    user_id=user_ids[0] if user_ids else "",
+                    org_id=org_id,
+                    query=query_text,
+                    cached=cache_hit,
+                    trace_id=trace_id,
+                )
+            )
+            if chunk_ids:
+                if doc_by_chunk is None:
+                    rows = (
+                        await session.execute(
+                            select(Chunk.id, Chunk.doc_id).where(
+                                Chunk.id.in_(chunk_ids), Chunk.org_id == org_id
+                            )
+                        )
+                    ).all()
+                    doc_by_chunk = {str(row.id): str(row.doc_id) for row in rows}
+                session.add_all(
+                    Citation(query_id=trace_id, chunk_id=cid, doc_id=doc_by_chunk[cid])
+                    for cid in chunk_ids
+                    if cid in doc_by_chunk and doc_by_chunk[cid]
+                )
+            await session.commit()
+    except Exception as exc:
+        logger.warning(
+            "query log write failed, proceeding without logging", extra={"exc": str(exc)}
+        )
+
+
 async def run_query(
     query: str, org_id: str, user_ids: list[str], feature_flags: dict, trace_id: str
 ) -> AsyncIterator[dict]:
@@ -63,11 +115,13 @@ async def run_query(
                 "masked": g.masked,
             }
             if not g.passed:
+                await _log_query(trace_id, user_ids, org_id, cleaned, cache_hit=False, chunk_ids=[])
                 yield {
                     "type": "done",
                     "answer": "Query blocked by guardrails.",
                     "chunk_ids": [],
                     "doc_ids": [],
+                    "query_id": trace_id,
                 }
                 return
 
@@ -81,11 +135,15 @@ async def run_query(
                 span.update(output={"fired": fired, "refusal": refusal})
                 if fired:
                     yield {"type": "status", "stage": "guard_model", "ok": False}
+                    await _log_query(
+                        trace_id, user_ids, org_id, cleaned, cache_hit=False, chunk_ids=[]
+                    )
                     yield {
                         "type": "done",
                         "answer": refusal or "Query blocked.",
                         "chunk_ids": [],
                         "doc_ids": [],
+                        "query_id": trace_id,
                     }
                     return
 
@@ -107,12 +165,21 @@ async def run_query(
                     span.update(output={"hit": cached is not None and cached.faithful})
                     if cached is not None and cached.faithful:
                         incr_cache(True)
+                        await _log_query(
+                            trace_id,
+                            user_ids,
+                            org_id,
+                            cleaned,
+                            cache_hit=True,
+                            chunk_ids=cached.chunk_ids,
+                        )
                         yield {"type": "status", "stage": "cache", "hit": True}
                         yield {
                             "type": "done",
                             "answer": cached.answer,
                             "chunk_ids": cached.chunk_ids,
                             "doc_ids": cached.doc_ids,
+                            "query_id": trace_id,
                         }
                         return
                     incr_cache(False)
@@ -186,11 +253,13 @@ async def run_query(
             yield {"type": "status", "stage": "retrieve", "count": len(contexts)}
 
         if not contexts:
+            await _log_query(trace_id, user_ids, org_id, cleaned, cache_hit=False, chunk_ids=[])
             yield {
                 "type": "done",
                 "answer": "I cannot confidently answer that based on the available documents.",
                 "chunk_ids": [],
                 "doc_ids": [],
+                "query_id": trace_id,
             }
             return
 
@@ -282,6 +351,21 @@ async def run_query(
                     span.update(output={"written": False, "error": str(exc)})
                 else:
                     span.update(output={"written": True})
-        yield {"type": "done", "answer": answer, "chunk_ids": chunk_ids, "doc_ids": doc_ids}
+        await _log_query(
+            trace_id,
+            user_ids,
+            org_id,
+            cleaned,
+            cache_hit=False,
+            chunk_ids=chunk_ids,
+            doc_by_chunk=doc_by_chunk,
+        )
+        yield {
+            "type": "done",
+            "answer": answer,
+            "chunk_ids": chunk_ids,
+            "doc_ids": doc_ids,
+            "query_id": trace_id,
+        }
     finally:
         root.end()

@@ -9,6 +9,11 @@ from app.rag.retrieval.retriever import RetrievedChunk
 
 QUERY = "what is the refund policy?"
 
+
+async def _noop_log(*args, **kwargs):
+    pass
+
+
 # gates on/off per test; cache + faithfulness off to keep the harness minimal
 BASE_FLAGS = {
     "cache.enabled": False,
@@ -229,6 +234,7 @@ class Harness:
         monkeypatch.setattr(orch, "get_cached", self.cache.get)
         monkeypatch.setattr(orch, "set_cached", self.cache.set)
         monkeypatch.setattr(orch, "rerank", self.rerank)
+        monkeypatch.setattr(orch, "_log_query", _noop_log)
         return self
 
     async def run(self, flags):
@@ -366,6 +372,7 @@ async def test_reranker_disabled_error_fails_open(monkeypatch):
         "answer": "Hello world",
         "chunk_ids": ["c1", "c2"],
         "doc_ids": ["d1", "d2"],
+        "query_id": "trace-1",
     }
 
 

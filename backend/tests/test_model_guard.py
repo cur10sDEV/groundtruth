@@ -12,6 +12,11 @@ GUARD = "openai/gpt-4o-mini"
 REFUSAL = "I cannot help with that."
 QUERY = "what is the refund policy?"
 
+
+async def _noop_log(*args, **kwargs):
+    pass
+
+
 FLAGS = {
     "cache.enabled": True,
     "faithfulness.enabled": True,
@@ -240,6 +245,7 @@ class Harness:
         monkeypatch.setattr(orch, "resolve_text_for_chunk_ids", self.resolve)
         monkeypatch.setattr(orch, "get_cached", self.cache.get)
         monkeypatch.setattr(orch, "set_cached", self.cache.set)
+        monkeypatch.setattr(orch, "_log_query", _noop_log)
         return self
 
     async def run(self, query=QUERY, flags=None):
@@ -291,6 +297,7 @@ async def test_flag_on_refusal_blocks_before_cache_and_retrieval(monkeypatch):
         "answer": REFUSAL,
         "chunk_ids": [],
         "doc_ids": [],
+        "query_id": "trace-1",
     }
     # nothing downstream of the guard ran
     assert h.cache.get_calls == []
