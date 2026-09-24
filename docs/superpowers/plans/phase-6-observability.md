@@ -7,7 +7,7 @@ JSON logging with correlation IDs, and Grafana dashboards, plus a `/metrics` end
 
 ## Dependencies
 
-Phase 0–5. Langfuse (`rag-langfuse` :3000), Prometheus (`rag-prometheus` :9090), Grafana
+Phase 0–5. Langfuse (`rag-langfuse` :3002), Prometheus (`rag-prometheus` :9090), Grafana
 (`rag-grafana` :3001) running.
 
 ---

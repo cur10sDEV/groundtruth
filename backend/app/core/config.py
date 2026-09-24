@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     # Langfuse
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""
-    langfuse_host: str = "http://localhost:3000"
+    langfuse_host: str = "http://localhost:3002"
 
     # CORS (comma-separated allowed browser origins)
     cors_origins: str = "http://localhost:3000"

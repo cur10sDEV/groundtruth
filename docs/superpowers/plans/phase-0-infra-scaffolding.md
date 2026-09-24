@@ -162,7 +162,7 @@ class Settings(BaseSettings):
     # Langfuse
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""
-    langfuse_host: str = "http://localhost:3000"
+    langfuse_host: str = "http://localhost:3002"
 
     # Auth
     jwt_secret: str = "change-me-in-prod"
@@ -255,7 +255,7 @@ FLAGSMITH_API_URL=http://localhost:8001/api/v1/
 FLAGSMITH_SERVER_KEY=
 LANGFUSE_PUBLIC_KEY=
 LANGFUSE_SECRET_KEY=
-LANGFUSE_HOST=http://localhost:3000
+LANGFUSE_HOST=http://localhost:3002
 JWT_SECRET=change-me-in-prod
 CORS_ORIGINS=http://localhost:3000
 ```
@@ -325,7 +325,7 @@ git commit -m "feat(backend): add pyproject, settings, and JSON logging"
   - Qdrant `rag-qdrant` on `:6333`/`:6334`.
   - Redis `rag-redis` on `:6379`.
   - RabbitMQ `rag-rabbitmq` on `:5672`/`:15672` (management UI).
-  - Langfuse `rag-langfuse` on `:3000` (see langfuse compose).
+  - Langfuse `rag-langfuse` on `:3002` (see langfuse compose).
   - Flagsmith `rag-flagsmith` on `:8000` (API) / `:8001` (edge) — edge is the SDK API at `:8001`.
   - Prometheus `rag-prometheus` on `:9090`.
   - Grafana `rag-grafana` on `:3001`.
