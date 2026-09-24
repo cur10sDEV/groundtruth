@@ -1,8 +1,9 @@
 import asyncio
 import hashlib
-from uuid import uuid4
+import uuid
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import IngestionError
 from app.core.logging import get_logger
@@ -19,6 +20,11 @@ from app.rag.retrieval.cache import invalidate_for_doc
 
 logger = get_logger(__name__)
 EMBED_BATCH = 32
+NAMESPACE_RAG = uuid.uuid5(uuid.NAMESPACE_DNS, "rag-prod.chunks")
+
+
+def _derive_chunk_id(doc_id: str, version: int, chunk_index: int) -> str:
+    return str(uuid.uuid5(NAMESPACE_RAG, f"{doc_id}:{version}:{chunk_index}"))
 
 
 def _hash(data: bytes) -> str:
@@ -47,6 +53,12 @@ def _cleanup_partial_qdrant(doc_id: str, version: int) -> None:
             extra={"doc_id": doc_id, "version": version},
             exc_info=True,
         )
+
+
+async def _reset_version(doc_id: str, version: int, session: AsyncSession) -> None:
+    """Clean slate for an ingest attempt: drop any leftovers from a previous attempt."""
+    await session.execute(delete(Chunk).where(Chunk.doc_id == doc_id, Chunk.version == version))
+    _cleanup_partial_qdrant(doc_id, version)
 
 
 async def _embed_and_store(doc: Document, chunks: list[dict], upserted: list[str]) -> None:
@@ -102,6 +114,8 @@ async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
                 INGESTION_PROCESSED.inc()
                 return 0
 
+            await _reset_version(doc_id, chunk_version, session)
+
             try:
                 parsed = parse_bytes(doc.original_filename, raw)
             except IngestionError:
@@ -117,7 +131,7 @@ async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
                         continue
                     chunks.append(
                         {
-                            "id": str(uuid4()),
+                            "id": _derive_chunk_id(doc.id, chunk_version, len(chunks)),
                             "doc_id": doc.id,
                             "user_id": doc.user_id,
                             "org_id": doc.org_id,

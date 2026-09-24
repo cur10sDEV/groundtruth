@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
 import io
+import uuid
+from contextlib import contextmanager
 
 import pytest
 from sqlalchemy import select
@@ -11,6 +13,7 @@ from app.core.metrics import INGESTION_FAILED, INGESTION_PROCESSED
 from app.db import get_session, init_db
 from app.models.chunk import Chunk
 from app.models.document import Document, DocumentStatus
+from app.rag.chunkers.base import ChunkData
 from app.rag.embed.embeddings import SparseVector
 from app.rag.ingestion import pipeline
 from app.rag.ingestion.pipeline import (
@@ -36,6 +39,15 @@ REQUIRED_PAYLOAD_KEYS = {
     "char_count",
     "type",
 }
+
+
+def _doc_version_filter(version: int) -> dict:
+    return {
+        "must": [
+            {"key": "doc_id", "match": {"value": DOC_ID}},
+            {"key": "version", "match": {"value": version}},
+        ]
+    }
 
 
 @pytest.mark.integration
@@ -73,13 +85,23 @@ def fake_s3(monkeypatch):
 
 @pytest.fixture
 def fake_qdrant(monkeypatch):
-    calls = {"upserts": [], "deletes": []}
+    calls = {"upserts": [], "deletes": [], "points": {}}
 
     def fake_upsert_points_batch(points):
         calls["upserts"].extend(points)
+        for p in points:
+            calls["points"][p["id"]] = p["payload"]
 
     def fake_delete_points(point_ids, payload_filter=None):
         calls["deletes"].append((point_ids, payload_filter))
+        if point_ids:
+            for point_id in point_ids:
+                calls["points"].pop(point_id, None)
+        elif payload_filter:
+            must = {m["key"]: m["match"]["value"] for m in payload_filter.get("must", [])}
+            for point_id, payload in list(calls["points"].items()):
+                if all(payload.get(k) == v for k, v in must.items()):
+                    del calls["points"][point_id]
 
     monkeypatch.setattr(pipeline, "upsert_points_batch", fake_upsert_points_batch)
     monkeypatch.setattr(pipeline, "delete_points", fake_delete_points)
@@ -322,7 +344,8 @@ async def test_ingest_cancelled_marks_failed_not_processing(db, fake_s3, fake_qd
     doc = await _get_doc()
     assert doc.status == DocumentStatus.FAILED
     assert doc.pending_version is None
-    assert fake_qdrant["deletes"] == []
+    # only the clean-slate reset ran; the cancel triggered no orphan cleanup
+    assert fake_qdrant["deletes"] == [([], _doc_version_filter(1))]
 
 
 async def test_ingest_versioned_sets_pending_version_during_attempt(
@@ -388,15 +411,11 @@ async def test_ingest_failure_deletes_partial_qdrant_points(
     assert upsert_calls == [32, 8]
     assert (await _get_doc()).status == DocumentStatus.FAILED
     assert await _chunks_for() == []
-    assert len(fake_qdrant["deletes"]) == 1
-    point_ids, payload_filter = fake_qdrant["deletes"][0]
-    assert point_ids == []
-    assert payload_filter == {
-        "must": [
-            {"key": "doc_id", "match": {"value": DOC_ID}},
-            {"key": "version", "match": {"value": 1}},
-        ]
-    }
+    # clean-slate reset at attempt start, then orphan cleanup after the failure
+    assert len(fake_qdrant["deletes"]) == 2
+    for point_ids, payload_filter in fake_qdrant["deletes"]:
+        assert point_ids == []
+        assert payload_filter == _doc_version_filter(1)
 
 
 async def test_ingest_pdf_roundtrip_per_page(db, fake_s3, fake_qdrant, fake_embeddings):
@@ -586,3 +605,169 @@ async def test_ingest_failure_increments_failed_total(db, fake_s3, fake_qdrant, 
         await ingest_document(DOC_ID, S3_KEY)
 
     assert INGESTION_FAILED._value.get() == before + 1
+
+
+# --- Deterministic chunk ids / idempotent re-ingest ---
+
+
+@contextmanager
+def _crash_on_second_get_session():
+    """Simulate a hard crash after commit A by failing the flip's session."""
+    real_get_session = pipeline.get_session
+    calls = {"n": 0}
+
+    def crashing_get_session():
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("crash between chunk commit and version flip")
+        return real_get_session()
+
+    pipeline.get_session = crashing_get_session
+    try:
+        yield
+    finally:
+        pipeline.get_session = real_get_session
+
+
+def test_chunk_id_derivation_is_deterministic():
+    first = pipeline._derive_chunk_id(DOC_ID, 2, 0)
+
+    assert first == pipeline._derive_chunk_id(DOC_ID, 2, 0)
+    assert len(first) == 36
+    uuid.UUID(first)
+    assert pipeline._derive_chunk_id(DOC_ID, 3, 0) != first
+    assert pipeline._derive_chunk_id(DOC_ID, 2, 1) != first
+    assert pipeline._derive_chunk_id("44444444-4444-4444-4444-444444444444", 2, 0) != first
+
+
+async def test_versioned_crash_window_redelivery_converges(
+    db, fake_s3, fake_qdrant, fake_embeddings, fake_cache
+):
+    fake_s3[S3_KEY] = b"Version two content with fresh words."
+    await _seed_doc(current_version=1)
+
+    with _crash_on_second_get_session(), pytest.raises(RuntimeError):
+        await ingest_versioned(DOC_ID, S3_KEY, 2)
+
+    # crash window state: v2 chunks/points committed but the flip never happened
+    doc = await _get_doc()
+    assert doc.current_version == 1
+    crashed_rows = await _chunks_for()
+    assert len(crashed_rows) >= 1
+    assert {r.version for r in crashed_rows} == {2}
+    assert {p["id"] for p in fake_qdrant["upserts"]} == {r.id for r in crashed_rows}
+    assert len(fake_qdrant["points"]) == len(crashed_rows)
+
+    # redelivery of the same message
+    count = await ingest_versioned(DOC_ID, S3_KEY, 2)
+
+    doc = await _get_doc()
+    assert doc.current_version == 2
+    assert doc.status == DocumentStatus.EMBEDDED
+    rows = await _chunks_for()
+    assert len(rows) == count
+    expected_ids = {pipeline._derive_chunk_id(DOC_ID, 2, i) for i in range(count)}
+    assert {r.id for r in rows} == expected_ids
+    # exactly one set of points survives: the derived ids, no duplicates
+    assert set(fake_qdrant["points"]) == expected_ids
+    assert len(fake_qdrant["upserts"]) == 2 * count
+    assert len({p["id"] for p in fake_qdrant["upserts"]}) == count
+    assert fake_qdrant["deletes"] == [([], _doc_version_filter(2)), ([], _doc_version_filter(2))]
+    assert fake_cache == [(ORG_ID, DOC_ID)]
+
+
+async def test_versioned_retry_with_fewer_chunks_leaves_no_leftovers(
+    db, fake_s3, fake_qdrant, fake_embeddings, fake_cache, monkeypatch
+):
+    body = "\n\n".join(f"Paragraph {i} carries fresh words." for i in range(3)).encode()
+    fake_s3[S3_KEY] = body
+    await _seed_doc(current_version=1)
+
+    with _crash_on_second_get_session(), pytest.raises(RuntimeError):
+        await ingest_versioned(DOC_ID, S3_KEY, 2)
+
+    assert len(await _chunks_for()) == 3
+    assert len(fake_qdrant["points"]) == 3
+
+    class TwoChunkChunker:
+        def chunk(self, text, page_number=0):
+            return [
+                ChunkData(text="Retry chunk one.", page_number=page_number, chunk_index=0),
+                ChunkData(text="Retry chunk two.", page_number=page_number, chunk_index=1),
+            ]
+
+    monkeypatch.setattr(pipeline, "get_chunker", lambda _ext: TwoChunkChunker())
+
+    count = await ingest_versioned(DOC_ID, S3_KEY, 2)
+
+    assert count == 2
+    expected_ids = {
+        pipeline._derive_chunk_id(DOC_ID, 2, 0),
+        pipeline._derive_chunk_id(DOC_ID, 2, 1),
+    }
+    assert {r.id for r in await _chunks_for()} == expected_ids
+    # the leftover third point/row from attempt 1 did not survive the retry
+    assert set(fake_qdrant["points"]) == expected_ids
+    assert pipeline._derive_chunk_id(DOC_ID, 2, 2) not in fake_qdrant["points"]
+    doc = await _get_doc()
+    assert doc.current_version == 2
+    assert doc.status == DocumentStatus.EMBEDDED
+
+
+async def test_dedup_short_circuit_does_not_wipe_existing_chunks(
+    db, fake_s3, fake_qdrant, fake_embeddings
+):
+    body = b"same bytes as before"
+    fake_s3[S3_KEY] = body
+    await _seed_doc(content_hash=hashlib.sha256(body).hexdigest())
+    kept_id = await _seed_chunk(version=1, text="existing chunk body")
+
+    count = await ingest_document(DOC_ID, S3_KEY)
+
+    assert count == 0
+    assert {r.id for r in await _chunks_for()} == {kept_id}
+    assert fake_qdrant["upserts"] == []
+    assert fake_qdrant["deletes"] == []
+
+
+async def test_plain_path_crash_retry_converges(
+    db, fake_s3, fake_qdrant, fake_embeddings, monkeypatch
+):
+    body = b"Alpha beta gamma delta epsilon zeta eta theta."
+    fake_s3[S3_KEY] = body
+    await _seed_doc(content_hash="different")
+
+    recorded_upsert = pipeline.upsert_points_batch
+
+    def crash_after_upsert(points):
+        recorded_upsert(points)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pipeline, "upsert_points_batch", crash_after_upsert)
+    with pytest.raises(KeyboardInterrupt):
+        await ingest_document(DOC_ID, S3_KEY)
+
+    # hard-crash residue: orphan points in qdrant, no PG rows, doc stuck in PROCESSING
+    assert (await _get_doc()).status == DocumentStatus.PROCESSING
+    assert await _chunks_for() == []
+    orphan_ids = set(fake_qdrant["points"])
+    assert orphan_ids
+    assert fake_qdrant["deletes"] == [([], _doc_version_filter(1))]
+
+    monkeypatch.setattr(pipeline, "upsert_points_batch", recorded_upsert)
+
+    count = await ingest_document(DOC_ID, S3_KEY)
+
+    assert count >= 1
+    doc = await _get_doc()
+    assert doc.status == DocumentStatus.EMBEDDED
+    assert doc.pending_version is None
+    assert doc.content_hash == hashlib.sha256(body).hexdigest()
+    rows = await _chunks_for()
+    assert len(rows) == count
+    expected_ids = {pipeline._derive_chunk_id(DOC_ID, 1, i) for i in range(count)}
+    assert {r.id for r in rows} == expected_ids
+    # the orphans were overwritten by the same deterministic ids: one set remains
+    assert set(fake_qdrant["points"]) == expected_ids
+    assert orphan_ids == expected_ids
+    assert fake_qdrant["deletes"] == [([], _doc_version_filter(1)), ([], _doc_version_filter(1))]
