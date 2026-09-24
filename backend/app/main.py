@@ -1,10 +1,14 @@
+import time
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
 
 from app.core.config import get_settings
 from app.core.errors import register_exception_handlers
 from app.core.logging import setup_logging
+from app.core.metrics import record_request
 
 
 @asynccontextmanager
@@ -31,4 +35,19 @@ def create_app() -> FastAPI:
     app.include_router(metrics_router)
     register_minio_webhook(app)
     register_exception_handlers(app)
+
+    @app.middleware("http")
+    async def metrics_middleware(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        start = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            record_request(time.perf_counter() - start, "error")
+            raise
+        status = "ok" if response.status_code < 500 else "error"
+        record_request(time.perf_counter() - start, status)
+        return response
+
     return app

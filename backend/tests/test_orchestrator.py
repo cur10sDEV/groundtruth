@@ -6,10 +6,12 @@ import app.core.telemetry as telemetry_module
 import app.db as db_module
 import app.rag.retrieval.orchestrator as orch
 from app.core.errors import LLMError
+from app.core.metrics import CACHE_HITS, CACHE_MISSES, TOKENS_IN, TOKENS_OUT
 from app.core.telemetry import trace_step
 from app.db import init_db
 from app.models.document import Document, DocumentStatus
 from app.rag.retrieval.cache import CachedEntry
+from app.rag.retrieval.generate import build_context_block
 from app.rag.retrieval.orchestrator import resolve_text_for_chunk_ids, run_query
 from app.rag.retrieval.retriever import RetrievedChunk
 
@@ -656,3 +658,94 @@ async def test_guardrail_block_run_still_ends_root_span(monkeypatch):
     assert names == ["query:trace-1", "guardrails"]
     # the early return still ends both the guardrails span and the root span
     assert all(obs.ended for obs in fake.observations)
+
+
+# --- Prometheus metrics (Task 6.3 wiring) ---
+
+
+async def test_cache_hit_increments_cache_hits(monkeypatch):
+    h = Harness()
+    h.cache.hit = CachedEntry(answer="cached!", chunk_ids=["c9"], doc_ids=["d9"], faithful=True)
+    h.install(monkeypatch)
+
+    hits_before = CACHE_HITS._value.get()
+    misses_before = CACHE_MISSES._value.get()
+
+    events = await h.run()
+
+    assert events[1] == {"type": "status", "stage": "cache", "hit": True}
+    assert CACHE_HITS._value.get() == hits_before + 1
+    assert CACHE_MISSES._value.get() == misses_before
+
+
+async def test_cache_miss_increments_cache_misses(monkeypatch):
+    h = Harness()
+    h.retriever.chunks = [chunk("c1", "d1")]
+    h.install(monkeypatch)
+
+    hits_before = CACHE_HITS._value.get()
+    misses_before = CACHE_MISSES._value.get()
+
+    events = await h.run()
+
+    assert events[1] == {"type": "status", "stage": "cache", "hit": False}
+    assert CACHE_MISSES._value.get() == misses_before + 1
+    assert CACHE_HITS._value.get() == hits_before
+
+
+async def test_generation_records_estimated_tokens(monkeypatch):
+    h = Harness()
+    h.retriever.chunks = [chunk("c1", "d1")]
+    h.install(monkeypatch)
+
+    tokens_in_before = TOKENS_IN._value.get()
+    tokens_out_before = TOKENS_OUT._value.get()
+
+    await h.run()
+
+    expected_contexts = [{"id": "c1", "text": "resolved-text-c1"}]
+    expected_in = len(build_context_block(expected_contexts)) // 4 + 1
+    expected_out = len("Hello world") // 4 + 1
+    assert TOKENS_IN._value.get() == tokens_in_before + expected_in
+    assert TOKENS_OUT._value.get() == tokens_out_before + expected_out
+
+
+async def test_cache_disabled_skips_hit_miss_accounting(monkeypatch):
+    h = Harness()
+    h.install(monkeypatch)
+
+    hits_before = CACHE_HITS._value.get()
+    misses_before = CACHE_MISSES._value.get()
+
+    events = [
+        ev
+        async for ev in run_query(
+            "what is the refund policy?",
+            "org-1",
+            ["u1"],
+            {"cache.enabled": False},
+            trace_id="trace-1",
+        )
+    ]
+
+    assert {"type": "status", "stage": "cache", "hit": False} not in events
+    assert events[-1]["type"] == "done"
+    assert CACHE_HITS._value.get() == hits_before
+    assert CACHE_MISSES._value.get() == misses_before
+
+
+async def test_cache_get_failure_does_not_account_hit_or_miss(monkeypatch):
+    h = Harness()
+    h.cache.raise_on_get = True
+    h.retriever.chunks = [chunk("c1", "d1")]
+    h.install(monkeypatch)
+
+    hits_before = CACHE_HITS._value.get()
+    misses_before = CACHE_MISSES._value.get()
+
+    events = await h.run()
+
+    assert events[1] == {"type": "status", "stage": "cache", "hit": False}
+    assert events[-1]["type"] == "done"
+    assert CACHE_HITS._value.get() == hits_before
+    assert CACHE_MISSES._value.get() == misses_before

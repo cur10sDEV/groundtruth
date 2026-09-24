@@ -7,6 +7,7 @@ from sqlalchemy import select
 
 import app.db as db_module
 from app.core.errors import IngestionError
+from app.core.metrics import INGESTION_FAILED, INGESTION_PROCESSED
 from app.db import get_session, init_db
 from app.models.chunk import Chunk
 from app.models.document import Document, DocumentStatus
@@ -500,3 +501,50 @@ async def test_cleanup_stale_deletes_old_versions(db, fake_qdrant):
 async def test_cleanup_stale_missing_doc_returns_zero(db, fake_qdrant):
     assert await cleanup_stale("missing-doc-id") == 0
     assert fake_qdrant["deletes"] == []
+
+
+# --- Prometheus metrics (Task 6.3 wiring) ---
+
+
+async def test_ingest_success_increments_processed_total(db, fake_s3, fake_qdrant, fake_embeddings):
+    fake_s3[S3_KEY] = b"Alpha beta gamma delta epsilon."
+    await _seed_doc(content_hash="different")
+
+    before = INGESTION_PROCESSED._value.get()
+
+    count = await ingest_document(DOC_ID, S3_KEY)
+
+    assert count >= 1
+    assert INGESTION_PROCESSED._value.get() == before + 1
+
+
+async def test_ingest_dedup_completing_embedded_counts_as_processed(
+    db, fake_s3, fake_qdrant, fake_embeddings
+):
+    body = b"same bytes as before"
+    fake_s3[S3_KEY] = body
+    await _seed_doc(content_hash=hashlib.sha256(body).hexdigest())
+
+    before = INGESTION_PROCESSED._value.get()
+
+    count = await ingest_document(DOC_ID, S3_KEY)
+
+    assert count == 0
+    assert INGESTION_PROCESSED._value.get() == before + 1
+
+
+async def test_ingest_failure_increments_failed_total(db, fake_s3, fake_qdrant, monkeypatch):
+    fake_s3[S3_KEY] = b"Alpha beta gamma delta."
+    await _seed_doc(content_hash="different")
+
+    async def failing_dense_embed(texts):
+        raise RuntimeError("embed down")
+
+    monkeypatch.setattr(pipeline, "dense_embed", failing_dense_embed)
+
+    before = INGESTION_FAILED._value.get()
+
+    with pytest.raises(RuntimeError):
+        await ingest_document(DOC_ID, S3_KEY)
+
+    assert INGESTION_FAILED._value.get() == before + 1

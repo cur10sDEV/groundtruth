@@ -6,6 +6,7 @@ from sqlalchemy import select
 
 from app.core.errors import IngestionError
 from app.core.logging import get_logger
+from app.core.metrics import INGESTION_FAILED, INGESTION_PROCESSED
 from app.core.qdrant_store import delete_points, upsert_points_batch
 from app.core.s3 import get_object
 from app.db import get_session
@@ -98,6 +99,7 @@ async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
                 doc.status = DocumentStatus.EMBEDDED
                 doc.pending_version = None
                 await session.commit()
+                INGESTION_PROCESSED.inc()
                 return 0
 
             try:
@@ -153,8 +155,10 @@ async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
             doc.status = DocumentStatus.EMBEDDED
             doc.pending_version = None
             await session.commit()
+            INGESTION_PROCESSED.inc()
             return len(chunks)
         except asyncio.CancelledError:
+            INGESTION_FAILED.inc()
             if upserted:
                 _cleanup_partial_qdrant(doc_id, chunk_version)
             doc.status = DocumentStatus.FAILED
@@ -162,6 +166,7 @@ async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
             await session.commit()
             raise
         except Exception:
+            INGESTION_FAILED.inc()
             if upserted:
                 _cleanup_partial_qdrant(doc_id, chunk_version)
             doc.status = DocumentStatus.FAILED

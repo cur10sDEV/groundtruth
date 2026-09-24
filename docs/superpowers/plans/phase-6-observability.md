@@ -222,6 +222,7 @@ git commit -m "feat(obs): wrap query pipeline stages in Langfuse spans"
   - `record_request(duration_seconds, status)` helper; `incr_cache(hit: bool)`; `record_tokens(in, out)`.
 - `routes_metrics.py`: `GET /metrics` returning `generate_latest()` with `prometheus_client` content type.
 - Modifies `main.py`: include metrics router.
+- Also WIRE the metrics: HTTP middleware (request latency/errors), orchestrator cache/tokens emission, pipeline ingestion counters.
 
 - [ ] **Step 1: Write the failing metrics test**
 

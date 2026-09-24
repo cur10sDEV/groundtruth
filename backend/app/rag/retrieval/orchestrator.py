@@ -4,6 +4,7 @@ from sqlalchemy import select
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.metrics import incr_cache, record_tokens
 from app.core.telemetry import ensure_trace, trace_step
 from app.db import get_sessionmaker
 from app.models.chunk import Chunk
@@ -11,7 +12,7 @@ from app.rag.guardrails.rules import run_guardrails, validate_output
 from app.rag.retrieval.cache import CachedEntry, get_cached, set_cached
 from app.rag.retrieval.faithfulness import check_faithfulness
 from app.rag.retrieval.filters import extract_filters
-from app.rag.retrieval.generate import generate_answer, truncate_contexts
+from app.rag.retrieval.generate import build_context_block, generate_answer, truncate_contexts
 from app.rag.retrieval.rerank import RerankerDisabledError, rerank
 from app.rag.retrieval.retriever import get_retriever
 from app.rag.retrieval.rewrite import rewrite_query
@@ -104,15 +105,17 @@ async def run_query(
                     span.update(output={"hit": False, "error": str(exc)})
                 else:
                     span.update(output={"hit": cached is not None and cached.faithful})
-                if cached is not None and cached.faithful:
-                    yield {"type": "status", "stage": "cache", "hit": True}
-                    yield {
-                        "type": "done",
-                        "answer": cached.answer,
-                        "chunk_ids": cached.chunk_ids,
-                        "doc_ids": cached.doc_ids,
-                    }
-                    return
+                    if cached is not None and cached.faithful:
+                        incr_cache(True)
+                        yield {"type": "status", "stage": "cache", "hit": True}
+                        yield {
+                            "type": "done",
+                            "answer": cached.answer,
+                            "chunk_ids": cached.chunk_ids,
+                            "doc_ids": cached.doc_ids,
+                        }
+                        return
+                    incr_cache(False)
                 yield {"type": "status", "stage": "cache", "hit": False}
 
         # rewrite (use cleaned query)
@@ -224,6 +227,7 @@ async def run_query(
                     answer_parts.append(ev["text"])
                     yield {"type": "token", "text": ev["text"]}
             answer = "".join(answer_parts)
+            record_tokens(len(build_context_block(contexts)) // 4 + 1, len(answer) // 4 + 1)
             span.update(output={"answer": answer, "model_used": model_used})
 
         # faithfulness
