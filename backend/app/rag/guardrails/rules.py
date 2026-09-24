@@ -8,7 +8,8 @@ _CARD_RE = re.compile(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b")
 _INJECTION_PATTERNS = [
     re.compile(r"ignore (all |your |previous |the )?(instructions|prompts|rules)", re.I),
     re.compile(r"reveal (your |the )?(system prompt|instructions)", re.I),
-    re.compile(r"you are now\s*(DAN|jailbroken|an unrestricted)", re.I),
+    re.compile(r"you are now\s*(DAN|jailbroken|an unrestricted|a non[-\s]?restricted)", re.I),
+    re.compile(r"(repeat|print|recite) .*system prompt", re.I),
     re.compile(r"act as (if )?you (are|were) .*(no|without|bypass).*(rules|restrictions)", re.I),
     re.compile(r"forget (all |your |the )?previous", re.I),
     re.compile(r"bypass (all )?restrictions", re.I),
