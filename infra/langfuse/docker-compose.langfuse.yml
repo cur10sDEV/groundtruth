@@ -4,11 +4,11 @@ services:
     container_name: rag-langfuse
     environment:
       DATABASE_URL: postgresql://rag:rag@postgres:5432/langfuse
-      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_URL: http://localhost:3002
       NEXTAUTH_SECRET: "change-me"
       SALT: "change-me"
       ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
-    ports: ["3000:3000"]
+    ports: ["3002:3000"]
     depends_on:
       postgres:
         condition: service_healthy
