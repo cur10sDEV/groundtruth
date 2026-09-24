@@ -1,0 +1,17 @@
+[
+  {
+    "question": "What is the refund policy for electronics?",
+    "expected_chunk_ids": ["chunk-elec-refund"],
+    "context": "Electronics purchased within 30 days can be returned for a full refund."
+  },
+  {
+    "question": "What is the company's remote work policy?",
+    "expected_chunk_ids": ["chunk-remote-policy"],
+    "context": "Employees may work remotely up to three days per week with manager approval."
+  },
+  {
+    "question": "What are the parental leave benefits?",
+    "expected_chunk_ids": ["chunk-parental-leave"],
+    "context": "Primary caregivers receive 16 weeks of paid parental leave."
+  }
+]
