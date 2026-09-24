@@ -35,6 +35,8 @@ Phase 4 (API routes), Phase 5 (Flagsmith wiring note). The backend API runs at
   - `lib/auth.tsx`: `AuthProvider` (React context) storing `token`, `user_id`, `org_id` in
     localStorage; `useAuth()` hook; `login(email, password)`, `signup(email, password, org_name)`.
   - Login/signup pages that call the backend `/auth/login` and `/auth/signup` then store the token.
+  - Backend prerequisite (this task): CORSMiddleware in create_app() with settings-driven origins
+    (default http://localhost:3000).
 
 - [ ] **Step 1: Write package.json and configs**
 

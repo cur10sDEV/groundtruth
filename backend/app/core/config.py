@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     langfuse_secret_key: str = ""
     langfuse_host: str = "http://localhost:3000"
 
+    # CORS (comma-separated allowed browser origins)
+    cors_origins: str = "http://localhost:3000"
+
     # Auth
     jwt_secret: str = "change-me-in-prod"
     jwt_algorithm: str = "HS256"
