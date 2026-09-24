@@ -3,6 +3,7 @@ import asyncio
 import litellm
 import pytest
 
+from app.core.config import get_settings
 from app.core.errors import LLMError
 from app.rag.retrieval.faithfulness import FaithfulnessResult, check_faithfulness
 from app.rag.retrieval.generate import (
@@ -128,6 +129,71 @@ def test_generate_answer_raises_llm_error_on_failure(monkeypatch):
         asyncio.run(collect())
 
 
+def test_generate_answer_falls_back_when_primary_fails(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY_FALLBACK", "fb-key")
+    s = get_settings()
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append((kwargs["model"], kwargs["api_key"]))
+        if kwargs["model"] == s.llm_primary_model:
+            raise RuntimeError("primary down")
+        return await _fake_stream(
+            [_FakeChunk("Hi", model=s.llm_fallback_model), _FakeChunk(" there")]
+        )(**kwargs)
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+
+    async def collect():
+        return [e async for e in generate_answer([{"text": "Alpha"}], "hi")]
+
+    events = asyncio.run(collect())
+    assert calls == [(s.llm_primary_model, None), (s.llm_fallback_model, "fb-key")]
+    assert events[0] == {"type": "meta", "model_used": s.llm_fallback_model}
+    assert events[1:] == [
+        {"type": "token", "text": "Hi"},
+        {"type": "token", "text": " there"},
+    ]
+
+
+def test_generate_answer_no_fallback_config_raises_llm_error(monkeypatch):
+    monkeypatch.setenv("LLM_FALLBACK_MODEL", "")
+
+    async def fake_acompletion(**kwargs):
+        raise RuntimeError("primary down")
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+
+    async def collect():
+        return [e async for e in generate_answer([{"text": "Alpha"}], "hi")]
+
+    with pytest.raises(LLMError):
+        asyncio.run(collect())
+
+
+def test_generate_answer_midstream_failure_does_not_retry(monkeypatch):
+    s = get_settings()
+
+    async def fake_acompletion(**kwargs):
+        async def gen():
+            yield _FakeChunk("partial", model=s.llm_primary_model)
+            raise RuntimeError("stream broke")
+
+        return gen()
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    events = []
+
+    async def collect():
+        async for e in generate_answer([{"text": "Alpha"}], "hi"):
+            events.append(e)
+
+    with pytest.raises(LLMError):
+        asyncio.run(collect())
+    # no duplicated retry tokens after output already started
+    assert [e["type"] for e in events] == ["meta", "token"]
+
+
 def test_check_faithfulness_scores_groundedness(monkeypatch):
     captured = {}
 
@@ -159,6 +225,32 @@ def test_check_faithfulness_threshold_is_07(monkeypatch):
 def test_check_faithfulness_wraps_llm_failures(monkeypatch):
     async def fake_acompletion(**kwargs):
         raise RuntimeError("llm down")
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    with pytest.raises(LLMError):
+        asyncio.run(check_faithfulness("q", "a", [{"text": "c"}]))
+
+
+def test_check_faithfulness_falls_back_when_primary_fails(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY_FALLBACK", "fb-key")
+    s = get_settings()
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append((kwargs["model"], kwargs["api_key"]))
+        if kwargs["model"] == s.llm_primary_model:
+            raise RuntimeError("primary down")
+        return _FakeResponse(_FakeMessage('{"score": 0.8}'))
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    result = asyncio.run(check_faithfulness("q", "a", [{"text": "c"}]))
+    assert result == FaithfulnessResult(faithful=True, score=0.8)
+    assert calls == [(s.llm_primary_model, None), (s.llm_fallback_model, "fb-key")]
+
+
+def test_check_faithfulness_raises_llm_error_when_both_fail(monkeypatch):
+    async def fake_acompletion(**kwargs):
+        raise RuntimeError("all providers down")
 
     monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
     with pytest.raises(LLMError):

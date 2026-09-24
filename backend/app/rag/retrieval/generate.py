@@ -35,25 +35,35 @@ async def generate_answer(contexts: list[dict], query: str) -> AsyncIterator[dic
         {"role": "system", "content": system},
         {"role": "user", "content": f"Context:\n{block}\n\nQuestion: {query}"},
     ]
-    try:
-        resp = await litellm.acompletion(
-            model=s.llm_primary_model,
-            api_key=s.llm_api_key_primary or None,
-            messages=messages,
-            max_tokens=s.max_output_tokens,
-            stream=True,
-        )
-        model_used = s.llm_primary_model
+    attempts: list[tuple[str, str]] = [(s.llm_primary_model, s.llm_api_key_primary)]
+    if s.llm_fallback_model:
+        attempts.append((s.llm_fallback_model, s.llm_api_key_fallback))
+    last_exc: Exception | None = None
+    for model, api_key in attempts:
         first = True
-        async for chunk in resp:
-            if first and getattr(chunk, "model", None):
-                model_used = chunk.model
+        try:
+            resp = await litellm.acompletion(
+                model=model,
+                api_key=api_key or None,
+                messages=messages,
+                max_tokens=s.max_output_tokens,
+                stream=True,
+            )
+            model_used = model
+            async for chunk in resp:
+                if first and getattr(chunk, "model", None):
+                    model_used = chunk.model
+                    yield {"type": "meta", "model_used": model_used}
+                    first = False
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    yield {"type": "token", "text": delta}
+            if first:
                 yield {"type": "meta", "model_used": model_used}
-                first = False
-            delta = chunk.choices[0].delta.content if chunk.choices else None
-            if delta:
-                yield {"type": "token", "text": delta}
-        if first:
-            yield {"type": "meta", "model_used": model_used}
-    except Exception as exc:
-        raise LLMError(detail=f"generation failed: {exc}") from exc
+            return
+        except Exception as exc:
+            last_exc = exc
+            # once anything was yielded, a retry would duplicate output — surface instead
+            if not first:
+                break
+    raise LLMError(detail=f"generation failed: {last_exc}") from last_exc
