@@ -47,16 +47,25 @@ async def sign_upload(body: SignIn, user: dict = Depends(get_current_user)) -> d
         )
         if versioned is not None:
             new_version = versioned.current_version + 1
-            versioned.status = DocumentStatus.PENDING
-            versioned.pending_version = new_version
+            result = await session.execute(
+                update(Document)
+                .where(Document.id == versioned.id, Document.status == DocumentStatus.EMBEDDED)
+                .values(status=DocumentStatus.PENDING, pending_version=new_version)
+                .execution_options(synchronize_session=False)
+            )
             await session.commit()
-            presigned = presign_upload(user["org_id"], user["user_id"], versioned.id, ext)
-            return {
-                "doc_id": versioned.id,
-                "status": "pending",
-                "new_version": new_version,
-                "upload": {"url": presigned["url"], "fields": presigned["fields"]},
-            }
+            if result.rowcount == 0:
+                # the EMBEDDED row vanished mid-sign (deleted, etc.) — fall
+                # through to the fresh-document branch instead of stomping
+                versioned = None
+            else:
+                presigned = presign_upload(user["org_id"], user["user_id"], versioned.id, ext)
+                return {
+                    "doc_id": versioned.id,
+                    "status": "pending",
+                    "new_version": new_version,
+                    "upload": {"url": presigned["url"], "fields": presigned["fields"]},
+                }
 
         doc = Document(
             user_id=user["user_id"],
@@ -155,8 +164,19 @@ async def delete_document(doc_id: str, user: dict = Depends(get_current_user)) -
         async with get_session() as session:
             d = await session.get(Document, doc_id)
             if d is not None:
-                await session.delete(d)
-                await session.commit()
+                try:
+                    await session.delete(d)
+                    await session.commit()
+                except Exception:
+                    # e.g. an in-flight ingest committed chunk rows between the
+                    # sweep and this delete (FK violation): keep the DELETING
+                    # tombstone; the reaper re-sweeps chunks and completes
+                    logger.warning(
+                        "delete: final row removal failed; tombstone left for the reaper",
+                        extra={"doc_id": doc_id},
+                        exc_info=True,
+                    )
+                    done = False
     return {"doc_id": doc_id, "status": "deleted" if done else "deleting"}
 
 

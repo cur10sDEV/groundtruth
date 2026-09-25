@@ -1,7 +1,12 @@
+import sqlite3
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.api.routes_documents as routes_documents
 import app.db as db_module
 import app.ingestion.cancel as cancel_module
 from app.auth.security import create_access_token
@@ -169,6 +174,61 @@ async def test_sign_same_filename_embedded_doc_becomes_new_version(client, monke
         assert [d.id for d in rows] == ["doc-v1"]  # no second row for a versioned re-upload
 
     assert presign_calls == [("org-1", "user-1", "doc-v1", "txt")]
+
+
+def _flip_to_deleting(db_path, doc_id):
+    # a second actor (the delete route) tombstones the row between /sign's
+    # select and its status write; a sync connection is the only seam
+    # available inside the statement-construct wrapper
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE documents SET status = 'DELETING' WHERE id = ?", (doc_id,))
+    conn.commit()
+    conn.close()
+
+
+async def test_sign_versioned_race_never_stomps_deleting(client, monkeypatch, tmp_path):
+    await _seed(
+        _org("org-1"),
+        _user("user-1"),
+        _doc("doc-v1", "org-1", "user-1", DocumentStatus.EMBEDDED, version=1),
+    )
+    real_update = routes_documents.update
+
+    def flipping_update(*args, **kwargs):
+        _flip_to_deleting(tmp_path / "routes_documents.db", "doc-v1")
+        return real_update(*args, **kwargs)
+
+    monkeypatch.setattr("app.api.routes_documents.update", flipping_update)
+    monkeypatch.setattr(
+        "app.api.routes_documents.presign_upload",
+        lambda *a: {"url": "u", "fields": {"key": "k"}, "key": "k"},
+    )
+
+    token = create_access_token(sub="user-1", org_id="org-1")
+    resp = await client.post(
+        "/documents/sign", json={"filename": "doc-v1.txt"}, headers=_auth(token)
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    # pinned behavior: the guarded update loses the race and /sign falls
+    # through to a fresh document row instead of writing over the tombstone
+    assert body["doc_id"] != "doc-v1"
+    assert body["status"] == "pending"
+    assert "new_version" not in body
+
+    async with db_module.get_session() as session:
+        old = await session.get(Document, "doc-v1")
+        assert old is not None
+        assert old.status == DocumentStatus.DELETING  # tombstone survived
+        assert old.pending_version is None  # never overwritten with a PENDING bump
+        assert old.current_version == 1
+        rows = (await session.execute(select(Document))).scalars().all()
+        fresh = [d for d in rows if d.id != "doc-v1"]
+        assert len(fresh) == 1
+        assert fresh[0].status == DocumentStatus.PENDING
+        assert fresh[0].pending_version is None
+        assert fresh[0].current_version == 1
 
 
 async def test_sign_requires_auth(client):
@@ -352,6 +412,47 @@ async def test_delete_partial_failure_leaves_tombstone(client, monkeypatch):
         assert doc.failure_reason is None
         rows = (await session.execute(select(Chunk).where(Chunk.doc_id == "doc-1"))).scalars().all()
         assert rows == []
+
+
+async def test_delete_final_row_delete_fk_race_keeps_tombstone(client, monkeypatch):
+    await _seed(
+        _org("org-1"),
+        _user("user-1"),
+        _doc("doc-1", "org-1", "user-1"),
+        _chunk("chunk-1", "doc-1", "org-1", "user-1", version=1, start_offset=0, end_offset=5),
+    )
+
+    async def fake_invalidate(org_id, doc_id):
+        pass
+
+    monkeypatch.setattr("app.api.routes_documents.delete_points", lambda *a, **k: None)
+    monkeypatch.setattr("app.api.routes_documents.invalidate_for_doc", fake_invalidate)
+    monkeypatch.setattr("app.api.routes_documents.delete_prefix", lambda *a: 1)
+
+    # sqlite does not enforce FKs in the test harness, so the mid-route
+    # chunk-commit race cannot produce a genuine IntegrityError here; instead
+    # the final row-delete raises the exact exception type the production
+    # flush would (chunks.doc_id FK) via a one-shot AsyncSession.delete patch
+    real_delete = AsyncSession.delete
+    raised: list[bool] = []
+
+    async def fk_race_delete(self, instance):
+        if not raised:
+            raised.append(True)
+            raise IntegrityError("DELETE FROM documents", {}, RuntimeError("FK: chunks.doc_id"))
+        return await real_delete(self, instance)
+
+    monkeypatch.setattr(AsyncSession, "delete", fk_race_delete)
+
+    token = create_access_token(sub="user-1", org_id="org-1")
+    resp = await client.delete("/documents/doc-1", headers=_auth(token))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"doc_id": "doc-1", "status": "deleting"}
+    async with db_module.get_session() as session:
+        doc = await session.get(Document, "doc-1")
+        assert doc is not None
+        assert doc.status == DocumentStatus.DELETING  # tombstone kept for the reaper
 
 
 async def test_delete_cascade_uses_owner_prefix_not_caller(client, monkeypatch):

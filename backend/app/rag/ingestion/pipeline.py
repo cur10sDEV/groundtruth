@@ -191,7 +191,9 @@ async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
                 try:
                     delete_object(s3_key)
                 except Exception:
-                    logger.warning("duplicate blob cleanup failed", extra={"s3_key": s3_key})
+                    logger.warning(
+                        "duplicate blob cleanup failed", extra={"s3_key": s3_key}, exc_info=True
+                    )
                 await _mark_failed(doc_id, reason=f"duplicate of {dup}")
                 return 0
 

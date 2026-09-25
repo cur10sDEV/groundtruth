@@ -10,6 +10,10 @@ type SignResponse = {
   upload: { url: string; fields: Record<string, string> };
 };
 
+// mirrors the backend cap (upload_max_bytes); the server still enforces it
+// via the presigned POST policy's content-length-range
+const MAX_FILE_BYTES = 50 * 1024 * 1024;
+
 export default function UploadButton({ onUploaded }: { onUploaded: () => void }) {
   const { auth } = useAuth();
   const [busy, setBusy] = useState(false);
@@ -17,6 +21,10 @@ export default function UploadButton({ onUploaded }: { onUploaded: () => void })
 
   const upload = async (file: File) => {
     if (!auth) return;
+    if (file.size > MAX_FILE_BYTES) {
+      setErr("File exceeds the 50 MB upload limit");
+      return;
+    }
     setBusy(true);
     setErr("");
     try {
