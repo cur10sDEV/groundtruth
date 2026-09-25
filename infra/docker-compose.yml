@@ -25,6 +25,16 @@ services:
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
+      # bucket-event trigger -> RabbitMQ (this MinIO release accepts notify
+      # targets via env vars only; `mc admin config set` is a silent no-op)
+      MINIO_NOTIFY_AMQP_ENABLE_PRIMARY: "on"
+      MINIO_NOTIFY_AMQP_URL_PRIMARY: "amqp://${RABBIT_USER:-guest}:${RABBIT_PASS:-guest}@rabbitmq:5672"
+      MINIO_NOTIFY_AMQP_EXCHANGE_PRIMARY: "minio.events"
+      MINIO_NOTIFY_AMQP_EXCHANGE_TYPE_PRIMARY: "direct"
+      MINIO_NOTIFY_AMQP_ROUTING_KEY_PRIMARY: "minio.events"
+      MINIO_NOTIFY_AMQP_DURABLE_PRIMARY: "on"
+      MINIO_NOTIFY_AMQP_QUEUE_DIR_PRIMARY: "/tmp/minio-events"
+      MINIO_NOTIFY_AMQP_QUEUE_LIMIT_PRIMARY: "10000"
     ports: ["9000:9000", "9001:9001"]
     volumes:
       - "miniodata:/data"
@@ -39,6 +49,11 @@ services:
     depends_on:
       minio:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBIT_USER: guest
+      RABBIT_PASS: guest
     volumes:
       - "./minio-init:/init"
     entrypoint: ["/bin/sh", "/init/init-bucket.sh"]

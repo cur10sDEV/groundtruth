@@ -72,6 +72,8 @@ async def process_message(body: dict) -> None:
             raise IngestionError(detail=f"malformed s3 key: {s3_key}") from exc
         if key_org != doc.org_id or key_user != doc.user_id:
             raise IngestionError(detail=f"s3 key does not match document owner: {s3_key}")
+        if doc.status == DocumentStatus.DELETING:
+            return
         if new_version is not None:
             # Versioned re-ingest is also the recovery path for a previous FAILED
             # attempt, so a FAILED doc proceeds. Skip only when the flip already

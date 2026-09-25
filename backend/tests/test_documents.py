@@ -1,12 +1,9 @@
-import hashlib
-
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 import app.db as db_module
 import app.ingestion.cancel as cancel_module
-from app.api.routes_documents import MAX_UPLOAD_BYTES
 from app.auth.security import create_access_token
 from app.core.errors import StorageError
 from app.db import init_db
@@ -15,10 +12,6 @@ from app.models.chunk import Chunk
 from app.models.document import Document, DocumentStatus
 from app.models.organization import Organization
 from app.models.user import User
-
-
-def test_max_upload_constant():
-    assert MAX_UPLOAD_BYTES == 50 * 1024 * 1024
 
 
 def _auth(token: str) -> dict:
@@ -80,22 +73,6 @@ def _chunk(
     )
 
 
-class _NoS3:
-    calls: list = []
-
-    def __call__(self, *args, **kwargs):
-        self.calls.append((args, kwargs))
-        raise AssertionError("put_object must not be called")
-
-
-class _NoPublish:
-    events: list = []
-
-    async def __call__(self, *args, **kwargs):
-        self.events.append((args, kwargs))
-        raise AssertionError("publish_ingestion must not be called")
-
-
 @pytest.fixture
 async def client(monkeypatch, tmp_path):
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path}/routes_documents.db")
@@ -111,262 +88,6 @@ async def client(monkeypatch, tmp_path):
     db_module._sessionmaker = None
 
 
-async def test_upload_creates_pending_document_and_publishes(client, monkeypatch):
-    await _seed(_org("org-1"), _user("user-1"))
-    s3_calls: list = []
-    events: list = []
-
-    def fake_put_object(org_id, user_id, doc_id, filename, data):
-        s3_calls.append((org_id, user_id, doc_id, filename, data))
-        return f"documents/{org_id}/{user_id}/{doc_id}/uuid.txt"
-
-    async def fake_publish(doc_id, s3_key):
-        events.append((doc_id, s3_key))
-
-    monkeypatch.setattr("app.api.routes_documents.put_object", fake_put_object)
-    monkeypatch.setattr("app.api.routes_documents.publish_ingestion", fake_publish)
-
-    token = create_access_token(sub="user-1", org_id="org-1")
-    resp = await client.post(
-        "/documents/upload",
-        files={"file": ("notes.txt", b"hello world", "text/plain")},
-        headers=_auth(token),
-    )
-
-    assert resp.status_code == 200
-    body = resp.json()
-    doc_id = body["doc_id"]
-    assert body["status"] == "processing"
-    assert body["s3_key"] == f"documents/org-1/user-1/{doc_id}/uuid.txt"
-
-    # fresh PENDING row with no pending_version before the ingest message is published
-    async with db_module.get_session() as session:
-        doc = await session.get(Document, doc_id)
-        assert doc is not None
-        assert doc.org_id == "org-1"
-        assert doc.user_id == "user-1"
-        assert doc.status == DocumentStatus.PENDING
-        assert doc.pending_version is None
-        assert doc.content_hash == hashlib.sha256(b"hello world").hexdigest()
-        assert doc.current_version == 1
-
-    assert s3_calls == [("org-1", "user-1", doc_id, "notes.txt", b"hello world")]
-    assert events == [(doc_id, f"documents/org-1/user-1/{doc_id}/uuid.txt")]
-
-
-async def test_upload_rejects_file_over_limit(client, monkeypatch):
-    await _seed(_org("org-1"), _user("user-1"))
-    events: list = []
-
-    async def fake_publish(doc_id, s3_key):
-        events.append((doc_id, s3_key))
-
-    monkeypatch.setattr("app.api.routes_documents.put_object", _NoS3())
-    monkeypatch.setattr("app.api.routes_documents.publish_ingestion", fake_publish)
-
-    token = create_access_token(sub="user-1", org_id="org-1")
-    big = b"x" * (MAX_UPLOAD_BYTES + 1)
-    resp = await client.post(
-        "/documents/upload",
-        files={"file": ("big.bin", big, "application/octet-stream")},
-        headers=_auth(token),
-    )
-
-    assert resp.status_code == 422
-    assert resp.json()["error"] == "file exceeds 50MB limit"
-    assert events == []
-    async with db_module.get_session() as session:
-        rows = (await session.execute(select(Document))).scalars().all()
-        assert rows == []
-
-
-async def test_upload_duplicate_embedded_returns_early(client, monkeypatch):
-    content_hash = hashlib.sha256(b"hello").hexdigest()
-    await _seed(
-        _org("org-1"),
-        _user("user-1"),
-        _doc("doc-dup", "org-1", "user-1", DocumentStatus.EMBEDDED, content_hash=content_hash),
-    )
-    monkeypatch.setattr("app.api.routes_documents.put_object", _NoS3())
-    monkeypatch.setattr("app.api.routes_documents.publish_ingestion", _NoPublish())
-
-    token = create_access_token(sub="user-1", org_id="org-1")
-    resp = await client.post(
-        "/documents/upload",
-        files={"file": ("hello.txt", b"hello", "text/plain")},
-        headers=_auth(token),
-    )
-
-    assert resp.status_code == 200
-    assert resp.json() == {
-        "doc_id": "doc-dup",
-        "status": "duplicate",
-        "already_embedded": True,
-    }
-    async with db_module.get_session() as session:
-        rows = (
-            (await session.execute(select(Document).where(Document.content_hash == content_hash)))
-            .scalars()
-            .all()
-        )
-        assert [d.id for d in rows] == ["doc-dup"]
-
-
-async def test_upload_same_hash_other_org_is_not_duplicate(client, monkeypatch):
-    content_hash = hashlib.sha256(b"hello").hexdigest()
-    await _seed(
-        _org("org-1"),
-        _org("org-2"),
-        _user("user-1"),
-        _user("user-2"),
-        _doc(
-            "doc-other-org", "org-2", "user-2", DocumentStatus.EMBEDDED, content_hash=content_hash
-        ),
-    )
-    s3_calls: list = []
-    events: list = []
-
-    def fake_put_object(org_id, user_id, doc_id, filename, data):
-        s3_calls.append((org_id, user_id, doc_id, filename, data))
-        return f"documents/{org_id}/{user_id}/{doc_id}/uuid.txt"
-
-    async def fake_publish(doc_id, s3_key):
-        events.append((doc_id, s3_key))
-
-    monkeypatch.setattr("app.api.routes_documents.put_object", fake_put_object)
-    monkeypatch.setattr("app.api.routes_documents.publish_ingestion", fake_publish)
-
-    token = create_access_token(sub="user-1", org_id="org-1")
-    resp = await client.post(
-        "/documents/upload",
-        files={"file": ("hello.txt", b"hello", "text/plain")},
-        headers=_auth(token),
-    )
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "processing"
-    assert body["doc_id"] != "doc-other-org"
-    assert len(events) == 1
-    async with db_module.get_session() as session:
-        doc = await session.get(Document, body["doc_id"])
-        assert doc is not None
-        assert doc.org_id == "org-1"
-
-
-async def test_upload_same_filename_embedded_doc_becomes_new_version(client, monkeypatch):
-    await _seed(
-        _org("org-1"),
-        _user("user-1"),
-        _doc("doc-v1", "org-1", "user-1", DocumentStatus.EMBEDDED, version=1),
-    )
-    s3_calls: list = []
-    events: list = []
-
-    def fake_put_object(org_id, user_id, doc_id, filename, data):
-        s3_calls.append((org_id, user_id, doc_id, filename, data))
-        return f"documents/{org_id}/{user_id}/{doc_id}/uuid.txt"
-
-    async def fake_publish(doc_id, s3_key, new_version=None):
-        events.append((doc_id, s3_key, new_version))
-
-    monkeypatch.setattr("app.api.routes_documents.put_object", fake_put_object)
-    monkeypatch.setattr("app.api.routes_documents.publish_ingestion", fake_publish)
-
-    token = create_access_token(sub="user-1", org_id="org-1")
-    resp = await client.post(
-        "/documents/upload",
-        files={"file": ("doc-v1.txt", b"fresh v2 bytes", "text/plain")},
-        headers=_auth(token),
-    )
-
-    assert resp.status_code == 200
-    assert resp.json() == {
-        "doc_id": "doc-v1",
-        "status": "processing",
-        "s3_key": "documents/org-1/user-1/doc-v1/uuid.txt",
-        "new_version": 2,
-    }
-    async with db_module.get_session() as session:
-        doc = await session.get(Document, "doc-v1")
-        assert doc.status == DocumentStatus.PENDING
-        assert doc.pending_version == 2
-        assert doc.current_version == 1
-        rows = (await session.execute(select(Document))).scalars().all()
-        assert [d.id for d in rows] == ["doc-v1"]  # no new row for a versioned upload
-    assert events == [("doc-v1", "documents/org-1/user-1/doc-v1/uuid.txt", 2)]
-
-
-async def test_upload_same_filename_failed_doc_creates_new_document(client, monkeypatch):
-    await _seed(
-        _org("org-1"),
-        _user("user-1"),
-        _doc("doc-failed", "org-1", "user-1", DocumentStatus.FAILED, version=1),
-    )
-    events: list = []
-
-    def fake_put_object(org_id, user_id, doc_id, filename, data):
-        return f"documents/{org_id}/{user_id}/{doc_id}/uuid.txt"
-
-    async def fake_publish(doc_id, s3_key, new_version=None):
-        events.append((doc_id, s3_key, new_version))
-
-    monkeypatch.setattr("app.api.routes_documents.put_object", fake_put_object)
-    monkeypatch.setattr("app.api.routes_documents.publish_ingestion", fake_publish)
-
-    token = create_access_token(sub="user-1", org_id="org-1")
-    resp = await client.post(
-        "/documents/upload",
-        files={"file": ("doc-failed.txt", b"retry bytes", "text/plain")},
-        headers=_auth(token),
-    )
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["doc_id"] != "doc-failed"
-    assert "new_version" not in body
-    assert events == [(body["doc_id"], body["s3_key"], None)]
-    async with db_module.get_session() as session:
-        failed = await session.get(Document, "doc-failed")
-        assert failed.status == DocumentStatus.FAILED  # untouched
-
-
-async def test_upload_same_filename_other_user_not_versioned(client, monkeypatch):
-    await _seed(
-        _org("org-1"),
-        _user("user-1"),
-        _user("user-2"),
-        _doc("doc-colleague", "org-1", "user-2", DocumentStatus.EMBEDDED, version=1),
-    )
-    events: list = []
-
-    def fake_put_object(org_id, user_id, doc_id, filename, data):
-        return f"documents/{org_id}/{user_id}/{doc_id}/uuid.txt"
-
-    async def fake_publish(doc_id, s3_key, new_version=None):
-        events.append((doc_id, s3_key, new_version))
-
-    monkeypatch.setattr("app.api.routes_documents.put_object", fake_put_object)
-    monkeypatch.setattr("app.api.routes_documents.publish_ingestion", fake_publish)
-
-    token = create_access_token(sub="user-1", org_id="org-1")
-    resp = await client.post(
-        "/documents/upload",
-        files={"file": ("doc-colleague.txt", b"my own bytes", "text/plain")},
-        headers=_auth(token),
-    )
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["doc_id"] != "doc-colleague"
-    assert "new_version" not in body
-
-
-async def test_upload_requires_auth(client):
-    resp = await client.post("/documents/upload", files={"file": ("a.txt", b"x", "text/plain")})
-    assert resp.status_code == 401
-
-
 async def test_sign_new_document_creates_pending_row(client, monkeypatch):
     await _seed(_org("org-1"), _user("user-1"))
     presign_calls: list = []
@@ -380,8 +101,6 @@ async def test_sign_new_document_creates_pending_row(client, monkeypatch):
         }
 
     monkeypatch.setattr("app.api.routes_documents.presign_upload", fake_presign)
-    monkeypatch.setattr("app.api.routes_documents.put_object", _NoS3())
-    monkeypatch.setattr("app.api.routes_documents.publish_ingestion", _NoPublish())
 
     token = create_access_token(sub="user-1", org_id="org-1")
     resp = await client.post(
@@ -426,8 +145,6 @@ async def test_sign_same_filename_embedded_doc_becomes_new_version(client, monke
         }
 
     monkeypatch.setattr("app.api.routes_documents.presign_upload", fake_presign)
-    monkeypatch.setattr("app.api.routes_documents.put_object", _NoS3())
-    monkeypatch.setattr("app.api.routes_documents.publish_ingestion", _NoPublish())
 
     token = create_access_token(sub="user-1", org_id="org-1")
     resp = await client.post(
@@ -455,6 +172,13 @@ async def test_sign_same_filename_embedded_doc_becomes_new_version(client, monke
 async def test_sign_requires_auth(client):
     resp = await client.post("/documents/sign", json={"filename": "a.txt"})
     assert resp.status_code == 401
+
+
+@pytest.mark.parametrize("filename", ["../evil.txt", "sub\\dir.txt"])
+async def test_sign_rejects_filenames_with_path_separators(client, filename):
+    token = create_access_token(sub="user-1", org_id="org-1")
+    resp = await client.post("/documents/sign", json={"filename": filename}, headers=_auth(token))
+    assert resp.status_code == 422
 
 
 async def test_list_documents_scoped_to_caller(client):

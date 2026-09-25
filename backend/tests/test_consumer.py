@@ -84,6 +84,26 @@ async def test_process_message_failed_doc_skips_ingestion(monkeypatch):
     assert calls == []
 
 
+async def test_process_message_deleting_doc_returns_without_ingesting(monkeypatch):
+    # deletion is linearized: a DELETING doc must never ingest, plain or versioned
+    _patch_session(monkeypatch, _doc(DocumentStatus.DELETING))
+    calls = []
+
+    async def must_not_ingest(doc_id, s3_key):
+        calls.append(("plain", doc_id))
+
+    async def must_not_ingest_versioned(doc_id, s3_key, new_version):
+        calls.append(("versioned", doc_id))
+
+    monkeypatch.setattr(consumer, "ingest_document", must_not_ingest)
+    monkeypatch.setattr(consumer, "ingest_versioned", must_not_ingest_versioned)
+
+    await process_message({"doc_id": DOC_ID, "s3_key": S3_KEY})
+    await process_message({"doc_id": DOC_ID, "s3_key": S3_KEY, "new_version": 2})
+
+    assert calls == []
+
+
 async def test_process_message_calls_ingest_document(monkeypatch):
     _patch_session(monkeypatch, _doc(DocumentStatus.PENDING))
     calls = []
