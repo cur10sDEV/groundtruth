@@ -32,6 +32,7 @@ export default function DocumentList({ refresh }: { refresh: number }) {
   const { auth } = useAuth();
   const [docs, setDocs] = useState<Doc[]>([]);
   const [err, setErr] = useState("");
+  const [note, setNote] = useState("");
   const [deleting, setDeleting] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -64,8 +65,13 @@ export default function DocumentList({ refresh }: { refresh: number }) {
     if (!auth || deleting === id) return;
     setDeleting(id);
     setErr("");
+    setNote("");
     try {
-      await apiFetch(`/documents/${id}`, { method: "DELETE", token: auth.token });
+      const res = await apiFetch<{ note?: string }>(`/documents/${id}`, {
+        method: "DELETE",
+        token: auth.token,
+      });
+      if (res.note) setNote(res.note);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Delete failed");
     } finally {
@@ -77,6 +83,7 @@ export default function DocumentList({ refresh }: { refresh: number }) {
   return (
     <div className="space-y-2">
       {err && <p className="text-red-600">{err}</p>}
+      {note && <p className="text-gray-600">{note}</p>}
       <ul className="space-y-2">
         {docs
           .filter((d) => d.status !== "DELETING")

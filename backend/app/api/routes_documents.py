@@ -6,8 +6,7 @@ from sqlalchemy import delete, select, update
 
 from app.auth.dependencies import get_current_user
 from app.core.errors import ValidationError
-from app.core.qdrant_store import delete_points
-from app.core.s3 import delete_prefix, presign_upload
+from app.core.s3 import presign_upload
 from app.db import get_session
 from app.models.chunk import Chunk
 from app.models.document import Document, DocumentStatus
@@ -117,7 +116,7 @@ async def list_documents(user: dict = Depends(get_current_user)) -> list[dict]:
 async def get_document(doc_id: str, user: dict = Depends(get_current_user)) -> dict:
     async with get_session() as session:
         doc = await session.get(Document, doc_id)
-        if doc is None or doc.org_id != user["org_id"]:
+        if doc is None or doc.org_id != user["org_id"] or doc.user_id != user["user_id"]:
             raise ValidationError(detail="document not found")
         return {
             "id": doc.id,
@@ -132,7 +131,7 @@ async def get_document(doc_id: str, user: dict = Depends(get_current_user)) -> d
 async def delete_document(doc_id: str, user: dict = Depends(get_current_user)) -> dict:
     async with get_session() as session:
         doc = await session.get(Document, doc_id)
-        if doc is None or doc.org_id != user["org_id"]:
+        if doc is None or doc.org_id != user["org_id"] or doc.user_id != user["user_id"]:
             raise ValidationError(detail="document not found")
         await session.execute(
             update(Document)
@@ -141,50 +140,23 @@ async def delete_document(doc_id: str, user: dict = Depends(get_current_user)) -
         )
         await session.execute(delete(Chunk).where(Chunk.doc_id == doc_id))
         await session.commit()
-    done = True
-    try:
-        delete_points(
-            [],
-            {"must": [{"key": "doc_id", "match": {"value": doc_id}}]},
-        )
-    except Exception:
-        logger.warning("delete: qdrant cleanup failed", extra={"doc_id": doc_id})
-        done = False
+    cache_cleared = True
     try:
         await invalidate_for_doc(user["org_id"], doc_id)
     except Exception:
-        logger.warning("delete: cache invalidation failed", extra={"doc_id": doc_id})
-        done = False
-    try:
-        delete_prefix(doc.org_id, doc.user_id, doc_id)
-    except Exception:
-        logger.warning("delete: blob cleanup failed", extra={"doc_id": doc_id})
-        done = False
-    if done:
-        async with get_session() as session:
-            d = await session.get(Document, doc_id)
-            if d is not None:
-                try:
-                    await session.delete(d)
-                    await session.commit()
-                except Exception:
-                    # e.g. an in-flight ingest committed chunk rows between the
-                    # sweep and this delete (FK violation): keep the DELETING
-                    # tombstone; the reaper re-sweeps chunks and completes
-                    logger.warning(
-                        "delete: final row removal failed; tombstone left for the reaper",
-                        extra={"doc_id": doc_id},
-                        exc_info=True,
-                    )
-                    done = False
-    return {"doc_id": doc_id, "status": "deleted" if done else "deleting"}
+        logger.warning("delete: cache invalidation failed", extra={"doc_id": doc_id}, exc_info=True)
+        cache_cleared = False
+    response = {"doc_id": doc_id, "status": "deleted"}
+    if not cache_cleared:
+        response["note"] = "changes may take a few minutes to fully take effect"
+    return response
 
 
 @router.get("/{doc_id}/chunks")
 async def get_doc_chunks(doc_id: str, user: dict = Depends(get_current_user)) -> list[dict]:
     async with get_session() as session:
         doc = await session.get(Document, doc_id)
-        if doc is None or doc.org_id != user["org_id"]:
+        if doc is None or doc.org_id != user["org_id"] or doc.user_id != user["user_id"]:
             raise ValidationError(detail="document not found")
         rows = (
             (

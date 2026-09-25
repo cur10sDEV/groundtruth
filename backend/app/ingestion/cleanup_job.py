@@ -151,7 +151,13 @@ async def complete_deletions() -> int:
         return completed
 
 
-async def cleanup_job_loop(interval_seconds: int = 3600) -> None:
+def _default_interval() -> int:
+    return get_settings().cleanup_interval_seconds
+
+
+async def cleanup_job_loop(interval_seconds: int | None = None) -> None:
+    if interval_seconds is None:
+        interval_seconds = _default_interval()
     while True:
         try:
             await complete_deletions()

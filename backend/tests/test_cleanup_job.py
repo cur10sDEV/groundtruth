@@ -4,6 +4,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.db as db_module
 from app.core.config import get_settings
@@ -340,6 +342,38 @@ async def test_complete_deletions_step_failure_leaves_tombstone_then_retry_compl
     assert await _get_doc(DOC_ID) is None
 
 
+async def test_complete_deletions_row_delete_fk_race_keeps_tombstone_then_retry_completes(
+    db, monkeypatch
+):
+    await _seed_doc(DOC_ID, status=DocumentStatus.DELETING)
+    await _seed_chunk(DOC_ID, version=1)
+
+    _mock_externals(monkeypatch)
+
+    real_delete = AsyncSession.delete
+    raised: list[bool] = []
+
+    async def fk_race_delete(self, instance):
+        if not raised:
+            raised.append(True)
+            raise IntegrityError("DELETE FROM documents", {}, RuntimeError("FK: chunks.doc_id"))
+        return await real_delete(self, instance)
+
+    monkeypatch.setattr(AsyncSession, "delete", fk_race_delete)
+
+    with pytest.raises(IntegrityError):
+        await cleanup_module.complete_deletions()
+
+    doc = await _get_doc(DOC_ID)
+    assert doc is not None
+    assert doc.status == DocumentStatus.DELETING
+
+    monkeypatch.setattr(AsyncSession, "delete", real_delete)
+    assert await cleanup_module.complete_deletions() == 1
+    assert await _get_doc(DOC_ID) is None
+    assert await _chunk_ids(DOC_ID) == set()
+
+
 async def test_cleanup_job_loop_runs_reaper_then_stale_sweep(monkeypatch):
     calls = []
 
@@ -369,3 +403,37 @@ async def test_cleanup_job_loop_runs_reaper_then_stale_sweep(monkeypatch):
         await cleanup_module.cleanup_job_loop(interval_seconds=1)
 
     assert calls == ["complete_deletions", "reap", "find_stale", ("cleanup", DOC_B)]
+
+
+async def test_cleanup_interval_defaults_to_config(monkeypatch):
+    assert get_settings().cleanup_interval_seconds == 300
+    assert cleanup_module._default_interval() == 300
+
+    slept: list[int] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+        raise asyncio.CancelledError
+
+    async def fake_complete_deletions():
+        pass
+
+    async def fake_reap():
+        pass
+
+    async def fake_find_stale_doc_ids(limit=100):
+        return []
+
+    async def must_not_cleanup_stale(doc_id):
+        raise AssertionError("no stale docs expected")
+
+    monkeypatch.setattr(cleanup_module, "complete_deletions", fake_complete_deletions)
+    monkeypatch.setattr(cleanup_module, "reap_abandoned_pends", fake_reap)
+    monkeypatch.setattr(cleanup_module, "find_stale_doc_ids", fake_find_stale_doc_ids)
+    monkeypatch.setattr(cleanup_module, "cleanup_stale", must_not_cleanup_stale)
+    monkeypatch.setattr(cleanup_module.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await cleanup_module.cleanup_job_loop()
+
+    assert slept == [get_settings().cleanup_interval_seconds]

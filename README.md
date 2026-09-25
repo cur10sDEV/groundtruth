@@ -106,9 +106,12 @@ the stale chunks/points. Byte-identical content under a new name is marked
 FAILED with `failure_reason: "duplicate of {id}"` and the duplicate blob is
 deleted.
 
-Deletion (`DELETE /documents/{id}`) tombstones the row as DELETING and sweeps
-chunks, Qdrant points, cached answers and MinIO blobs; any step that fails
-leaves the tombstone for the worker's reaper to finish. The same reaper resolves
+Deletion (`DELETE /documents/{id}`) tombstones the row as DELETING, sweeps its
+chunks and best-effort invalidates cached answers, then returns immediately;
+physical cleanup (Qdrant points, MinIO blobs, row removal) is owned by the
+worker's reaper and completes within `CLEANUP_INTERVAL_SECONDS` (default 5 min).
+If cache invalidation was unavailable, the API says so via the response's
+`note` field. The same reaper resolves
 rows stuck PENDING for `REAPER_PENDING_AFTER_SECONDS`: abandoned first-uploads
 are deleted together with their blobs, abandoned versioned re-uploads are
 restored to EMBEDDED (v1 was never touched).

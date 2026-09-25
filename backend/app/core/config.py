@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     upload_max_bytes: int = 50 * 1024 * 1024
     presign_expiry_seconds: int = 900
     reaper_pending_after_seconds: int = 3600
+    cleanup_interval_seconds: int = 300
 
     # Tokens
     max_input_tokens: int = 8000
