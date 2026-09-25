@@ -3,6 +3,7 @@ import hashlib
 import io
 import uuid
 from contextlib import contextmanager
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
@@ -815,4 +816,181 @@ async def test_mark_failed_does_not_stomp_deleting(db):
 
     doc = await _get_doc()
     assert doc.status == DocumentStatus.DELETING
+    assert doc.failure_reason is None
+
+
+async def test_mark_failed_persists_reason_when_landed(db):
+    await _seed_doc()
+    async with get_session() as session:
+        doc = await session.get(Document, DOC_ID)
+        doc.status = DocumentStatus.PROCESSING
+        await session.commit()
+
+    landed = await pipeline._mark_failed(DOC_ID, reason="boom")
+
+    assert landed is True
+    doc = await _get_doc()
+    assert doc.status == DocumentStatus.FAILED
+    assert doc.failure_reason == "boom"
+    assert doc.pending_version is None
+
+
+async def test_mark_failed_lost_race_keeps_failed_metric_flat(db):
+    await _seed_doc()
+    async with get_session() as session:
+        doc = await session.get(Document, DOC_ID)
+        doc.status = DocumentStatus.DELETING
+        await session.commit()
+
+    before = INGESTION_FAILED._value.get()
+
+    landed = await pipeline._mark_failed(DOC_ID, reason="boom")
+
+    assert landed is False
+    assert INGESTION_FAILED._value.get() == before
+
+
+async def test_finalize_clears_stale_failure_reason_on_recovery(
+    db, fake_s3, fake_qdrant, fake_embeddings
+):
+    fake_s3[S3_KEY] = b"Alpha beta gamma delta epsilon."
+    await _seed_doc(content_hash="different")
+    async with get_session() as session:
+        doc = await session.get(Document, DOC_ID)
+        doc.status = DocumentStatus.FAILED
+        doc.failure_reason = "previous attempt broke"
+        await session.commit()
+
+    count = await ingest_document(DOC_ID, S3_KEY)
+
+    assert count >= 1
+    doc = await _get_doc()
+    assert doc.status == DocumentStatus.EMBEDDED
+    assert doc.failure_reason is None
+
+
+# --- Cross-document duplicate detection (user-scoped) ---
+
+
+OTHER_DOC_ID = "44444444-4444-4444-4444-444444444444"
+OTHER_USER_ID = "55555555-5555-5555-5555-555555555555"
+
+
+async def _seed_other_doc(
+    doc_id: str = OTHER_DOC_ID,
+    user_id: str = USER_ID,
+    status: DocumentStatus = DocumentStatus.EMBEDDED,
+    content_hash: str = "other-hash",
+) -> None:
+    async with get_session() as session:
+        session.add(
+            Document(
+                id=doc_id,
+                user_id=user_id,
+                org_id=ORG_ID,
+                original_filename="twin.txt",
+                status=status,
+                content_hash=content_hash,
+                current_version=1,
+            )
+        )
+        await session.commit()
+
+
+async def test_cross_doc_duplicate_marks_failed_with_reason(
+    db, fake_s3, fake_qdrant, fake_embeddings, monkeypatch
+):
+    body = b"Alpha beta gamma delta epsilon zeta eta theta."
+    fake_s3[S3_KEY] = body
+    await _seed_doc(content_hash="different")
+    await _seed_other_doc(content_hash=hashlib.sha256(body).hexdigest())
+
+    deleted: list[str] = []
+    monkeypatch.setattr(pipeline, "delete_object", lambda k: deleted.append(k))
+    reset = AsyncMock()
+    monkeypatch.setattr(pipeline, "_reset_version", reset)
+    failed_before = INGESTION_FAILED._value.get()
+    processed_before = INGESTION_PROCESSED._value.get()
+
+    count = await ingest_document(DOC_ID, S3_KEY)
+
+    assert count == 0
+    doc = await _get_doc()
+    assert doc.status == DocumentStatus.FAILED
+    assert doc.pending_version is None
+    assert doc.failure_reason == f"duplicate of {OTHER_DOC_ID}"
+    assert deleted == [S3_KEY]
+    reset.assert_not_called()
+    assert fake_qdrant["upserts"] == []
+    assert fake_embeddings["dense"] == []
+    assert await _chunks_for() == []
+    # a duplicate is an expected outcome, not a system failure: no metric moves
+    assert INGESTION_FAILED._value.get() == failed_before
+    assert INGESTION_PROCESSED._value.get() == processed_before
+
+
+async def test_duplicate_check_is_user_scoped(
+    db, fake_s3, fake_qdrant, fake_embeddings, monkeypatch
+):
+    body = b"Alpha beta gamma delta epsilon zeta eta theta."
+    fake_s3[S3_KEY] = body
+    await _seed_doc(content_hash="different")
+    # same org, DIFFERENT user, same bytes: not this user's duplicate
+    await _seed_other_doc(user_id=OTHER_USER_ID, content_hash=hashlib.sha256(body).hexdigest())
+
+    deleted: list[str] = []
+    monkeypatch.setattr(pipeline, "delete_object", lambda k: deleted.append(k))
+
+    count = await ingest_document(DOC_ID, S3_KEY)
+
+    assert count >= 1
+    assert deleted == []
+    doc = await _get_doc()
+    assert doc.status == DocumentStatus.EMBEDDED
+    assert doc.failure_reason is None
+
+
+async def test_duplicate_check_excludes_self(
+    db, fake_s3, fake_qdrant, fake_embeddings, fake_cache, monkeypatch
+):
+    body = b"Identical content across versions."
+    fake_s3[S3_KEY] = body
+    # doc already served these exact bytes at v1; republishing them as v2
+    # must not flag the doc as a duplicate of itself
+    await _seed_doc(content_hash=hashlib.sha256(body).hexdigest(), current_version=1)
+
+    deleted: list[str] = []
+    monkeypatch.setattr(pipeline, "delete_object", lambda k: deleted.append(k))
+
+    count = await ingest_versioned(DOC_ID, S3_KEY, 2)
+
+    assert count >= 1
+    assert deleted == []
+    doc = await _get_doc()
+    assert doc.status == DocumentStatus.EMBEDDED
+    assert doc.current_version == 2
+    assert doc.failure_reason is None
+    assert {r.version for r in await _chunks_for()} == {2}
+
+
+async def test_duplicate_ignores_non_embedded(
+    db, fake_s3, fake_qdrant, fake_embeddings, monkeypatch
+):
+    body = b"Alpha beta gamma delta epsilon zeta eta theta."
+    fake_s3[S3_KEY] = body
+    await _seed_doc(content_hash="different")
+    # same user, same bytes, but never finished ingesting: not a duplicate source
+    await _seed_other_doc(
+        status=DocumentStatus.PENDING, content_hash=hashlib.sha256(body).hexdigest()
+    )
+
+    deleted: list[str] = []
+    monkeypatch.setattr(pipeline, "delete_object", lambda k: deleted.append(k))
+
+    count = await ingest_document(DOC_ID, S3_KEY)
+
+    assert count >= 1
+    assert deleted == []
+    doc = await _get_doc()
+    assert doc.status == DocumentStatus.EMBEDDED
     assert doc.failure_reason is None

@@ -9,7 +9,7 @@ from app.core.errors import IngestionError
 from app.core.logging import get_logger
 from app.core.metrics import INGESTION_FAILED, INGESTION_PROCESSED
 from app.core.qdrant_store import delete_points, upsert_points_batch
-from app.core.s3 import get_object
+from app.core.s3 import delete_object, get_object
 from app.db import get_session
 from app.models.chunk import Chunk
 from app.models.document import Document, DocumentStatus
@@ -67,6 +67,7 @@ async def _finalize(doc_id: str, content_hash: str, new_version: int | None = No
         "status": DocumentStatus.EMBEDDED,
         "pending_version": None,
         "content_hash": content_hash,
+        "failure_reason": None,
     }
     if new_version is not None:
         values["current_version"] = new_version
@@ -169,6 +170,29 @@ async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
             if dedup and content_hash == doc.content_hash:
                 await _finalize(doc_id, content_hash=doc.content_hash)
                 INGESTION_PROCESSED.inc()
+                return 0
+
+            dup = (
+                (
+                    await session.execute(
+                        select(Document.id).where(
+                            Document.content_hash == content_hash,
+                            Document.org_id == doc.org_id,
+                            Document.user_id == doc.user_id,
+                            Document.id != doc_id,
+                            Document.status == DocumentStatus.EMBEDDED,
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if dup is not None:
+                try:
+                    delete_object(s3_key)
+                except Exception:
+                    logger.warning("duplicate blob cleanup failed", extra={"s3_key": s3_key})
+                await _mark_failed(doc_id, reason=f"duplicate of {dup}")
                 return 0
 
             await _reset_version(doc_id, chunk_version, session)
