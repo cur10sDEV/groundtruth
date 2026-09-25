@@ -26,7 +26,7 @@ def _drop(reason: str, key: str = "") -> bool:
 def _record(event: dict) -> dict:
     # MinIO notification payloads nest the S3 record under Records[0]
     # (with a lowercase eventName and a percent-encoded object key);
-    # the flat shape is accepted for symmetry with the legacy webhook tests.
+    # the flat top-level shape is accepted for symmetry with the unit tests.
     records = event.get("Records")
     if isinstance(records, list) and records:
         return records[0]

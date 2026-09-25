@@ -64,7 +64,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(DomainError)
     async def domain_error_handler(request: Request, exc: DomainError):
         # reuse the request's correlation id when one is in scope (set by the
-        # query / webhook routes) instead of minting a fresh one
+        # query routes) instead of minting a fresh one
         trace_id = get_correlation_id() or new_correlation_id()
         logger.error("domain error", extra={"correlation_id": trace_id})
         return JSONResponse(

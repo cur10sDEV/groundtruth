@@ -51,9 +51,6 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-    environment:
-      RABBIT_USER: guest
-      RABBIT_PASS: guest
     volumes:
       - "./minio-init:/init"
     entrypoint: ["/bin/sh", "/init/init-bucket.sh"]

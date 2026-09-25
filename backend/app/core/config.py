@@ -31,9 +31,6 @@ class Settings(BaseSettings):
     # RabbitMQ
     rabbitmq_url: str = "amqp://guest:guest@localhost:5672/"
 
-    # Shared secret required on the (optional) MinIO webhook endpoint
-    webhook_secret: str = ""
-
     # LLM routing (LiteLLM). Primary + fallback.
     llm_primary_model: str = "openai/gpt-4o"
     llm_fallback_model: str = "anthropic/claude-3-5-sonnet-20241022"

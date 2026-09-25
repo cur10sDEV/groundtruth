@@ -41,7 +41,6 @@ Copy `backend/.env.example` → `backend/.env` and `frontend/.env.example` →
 | `RERANKER_API_KEY` | optional | Cohere key (only if `reranker.enabled` is on) |
 | `FLAGSMITH_SERVER_KEY` / `NEXT_PUBLIC_FLAGSMITH_KEY` | optional | live flags; built-in defaults apply when unset |
 | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | optional | tracing UI at http://localhost:3002 |
-| `WEBHOOK_SECRET` | optional | shared secret for the MinIO webhook (see below) |
 
 ## Feature flags
 
@@ -75,7 +74,7 @@ backend/.venv/bin/python -m eval.answer_eval      # faithfulness/relevance helpe
 | Service | Port | Purpose |
 | --- | --- | --- |
 | backend API (uvicorn) | 8002 | REST + SSE `/query`, `/documents`, `/auth`, `/health`, `/metrics` |
-| ingestion worker | – | RabbitMQ consumer + stale-version cleanup loop |
+| ingestion worker | – | event translator + RabbitMQ consumer + cleanup/reaper loop |
 | frontend (Next.js) | 3000 | chat UI, document upload |
 | postgres | 5432 | documents, chunks, memberships, query logs (dbs: rag, flagsmith, flag_engine, langfuse — auto-created on first boot) |
 | minio | 9000 / 9001 | document storage (S3 API / console) |
@@ -86,14 +85,38 @@ backend/.venv/bin/python -m eval.answer_eval      # faithfulness/relevance helpe
 | langfuse | 3002 | LLM tracing UI (via compose overlay) |
 | prometheus / grafana | 9090 / 3001 | metrics scraping + dashboards |
 
-Upload flow: `POST /documents/upload` stores the object in MinIO and publishes
-an ingest message to RabbitMQ (direct publish is the canonical path); the
-worker parses, chunks, embeds and upserts to Qdrant + Postgres, flipping the
-document version on success. Re-uploading a file with the same name creates a
-new version of that document; old versions keep serving until the flip, and a
-periodic job cleans stale chunks/points afterwards.
+Upload: `POST /documents/sign` returns a presigned POST policy (creating a PENDING
+row, or a version bump on an existing same-name document); the browser then
+FormData-POSTs the file **directly to MinIO** — the backend never proxies bytes.
+The 50 MB cap (`UPLOAD_MAX_BYTES`) is enforced by MinIO's POST policy itself.
 
-The MinIO webhook (`POST /internal/minio-event`) is an **optional** alternative
-ingest trigger: it is authenticated (`X-Webhook-Secret` header must match
-`WEBHOOK_SECRET`; an unset secret disables the endpoint) and is not wired into
-the MinIO container by default.
+Trigger: MinIO's `notify_amqp` target publishes `s3:ObjectCreated:*` events under
+`documents/` to the `minio.events` exchange. The worker's translator validates
+each event (event type, bucket, key shape, a matching PENDING/PROCESSING row,
+key-vs-row ownership) and is the **only** publisher into the `ingestion` queue,
+which the worker consumes to parse, chunk, embed and upsert to Qdrant + Postgres,
+flipping the document to EMBEDDED on success. Invalid events are dropped
+terminally — noise never retries, by design — and counted in the
+`rag_events_dropped_total` metric on `/metrics`; a dropped event simply leaves
+its row PENDING for the reaper.
+
+Re-uploading the same filename signs a new version of that document: v1 keeps
+serving until the new version flips EMBEDDED, after which a periodic job cleans
+the stale chunks/points. Byte-identical content under a new name is marked
+FAILED with `failure_reason: "duplicate of {id}"` and the duplicate blob is
+deleted.
+
+Deletion (`DELETE /documents/{id}`) tombstones the row as DELETING and sweeps
+chunks, Qdrant points, cached answers and MinIO blobs; any step that fails
+leaves the tombstone for the worker's reaper to finish. The same reaper resolves
+rows stuck PENDING for `REAPER_PENDING_AFTER_SECONDS`: abandoned first-uploads
+are deleted together with their blobs, abandoned versioned re-uploads are
+restored to EMBEDDED (v1 was never touched).
+
+Compose note: the `minio` service's `MINIO_NOTIFY_AMQP_URL_PRIMARY` interpolates
+`amqp://${RABBIT_USER:-guest}:${RABBIT_PASS:-guest}@rabbitmq:5672` from the
+**host** environment (your shell, or the `.env` file in the directory
+`docker compose` runs from) — matching the compose `rabbitmq` service's default
+guest/guest credentials. Container-level env vars never feed this interpolation;
+changing broker credentials means overriding the pair on the host *and*
+parameterizing the `rabbitmq` service itself.
