@@ -367,6 +367,96 @@ async def test_upload_requires_auth(client):
     assert resp.status_code == 401
 
 
+async def test_sign_new_document_creates_pending_row(client, monkeypatch):
+    await _seed(_org("org-1"), _user("user-1"))
+    presign_calls: list = []
+
+    def fake_presign(org_id, user_id, doc_id, ext):
+        presign_calls.append((org_id, user_id, doc_id, ext))
+        return {
+            "url": "u",
+            "fields": {"key": "k"},
+            "key": f"documents/{org_id}/{user_id}/{doc_id}/x.pdf",
+        }
+
+    monkeypatch.setattr("app.api.routes_documents.presign_upload", fake_presign)
+    monkeypatch.setattr("app.api.routes_documents.put_object", _NoS3())
+    monkeypatch.setattr("app.api.routes_documents.publish_ingestion", _NoPublish())
+
+    token = create_access_token(sub="user-1", org_id="org-1")
+    resp = await client.post(
+        "/documents/sign", json={"filename": "policy.pdf"}, headers=_auth(token)
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    doc_id = body["doc_id"]
+    assert body["status"] == "pending"
+    assert body["upload"] == {"url": "u", "fields": {"key": "k"}}
+    assert "new_version" not in body
+
+    async with db_module.get_session() as session:
+        doc = await session.get(Document, doc_id)
+        assert doc is not None
+        assert doc.org_id == "org-1"
+        assert doc.user_id == "user-1"
+        assert doc.original_filename == "policy.pdf"
+        assert doc.status == DocumentStatus.PENDING
+        assert doc.pending_version is None
+        assert doc.content_hash == ""  # unknown until the worker fetches the object
+        assert doc.current_version == 1
+
+    assert presign_calls == [("org-1", "user-1", doc_id, "pdf")]
+
+
+async def test_sign_same_filename_embedded_doc_becomes_new_version(client, monkeypatch):
+    await _seed(
+        _org("org-1"),
+        _user("user-1"),
+        _doc("doc-v1", "org-1", "user-1", DocumentStatus.EMBEDDED, version=1),
+    )
+    presign_calls: list = []
+
+    def fake_presign(org_id, user_id, doc_id, ext):
+        presign_calls.append((org_id, user_id, doc_id, ext))
+        return {
+            "url": "u",
+            "fields": {"key": "k"},
+            "key": f"documents/{org_id}/{user_id}/{doc_id}/x.txt",
+        }
+
+    monkeypatch.setattr("app.api.routes_documents.presign_upload", fake_presign)
+    monkeypatch.setattr("app.api.routes_documents.put_object", _NoS3())
+    monkeypatch.setattr("app.api.routes_documents.publish_ingestion", _NoPublish())
+
+    token = create_access_token(sub="user-1", org_id="org-1")
+    resp = await client.post(
+        "/documents/sign", json={"filename": "doc-v1.txt"}, headers=_auth(token)
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["doc_id"] == "doc-v1"
+    assert body["status"] == "pending"
+    assert body["new_version"] == 2
+    assert body["upload"] == {"url": "u", "fields": {"key": "k"}}
+
+    async with db_module.get_session() as session:
+        doc = await session.get(Document, "doc-v1")
+        assert doc.status == DocumentStatus.PENDING
+        assert doc.pending_version == 2
+        assert doc.current_version == 1
+        rows = (await session.execute(select(Document))).scalars().all()
+        assert [d.id for d in rows] == ["doc-v1"]  # no second row for a versioned re-upload
+
+    assert presign_calls == [("org-1", "user-1", "doc-v1", "txt")]
+
+
+async def test_sign_requires_auth(client):
+    resp = await client.post("/documents/sign", json={"filename": "a.txt"})
+    assert resp.status_code == 401
+
+
 async def test_list_documents_scoped_to_caller(client):
     await _seed(
         _org("org-1"),

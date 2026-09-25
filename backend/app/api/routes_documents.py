@@ -2,12 +2,13 @@ import hashlib
 import logging
 
 from fastapi import APIRouter, Depends, File, UploadFile
+from pydantic import BaseModel
 from sqlalchemy import delete, select, update
 
 from app.auth.dependencies import get_current_user
 from app.core.errors import ValidationError
 from app.core.qdrant_store import delete_points
-from app.core.s3 import delete_prefix, put_object
+from app.core.s3 import delete_prefix, presign_upload, put_object
 from app.db import get_session
 from app.ingestion.publisher import publish_ingestion
 from app.models.chunk import Chunk
@@ -91,6 +92,65 @@ async def upload_document(
         s3_key = put_object(user["org_id"], user["user_id"], doc.id, filename, data)
         await publish_ingestion(doc.id, s3_key)
         return {"doc_id": doc.id, "status": "processing", "s3_key": s3_key}
+
+
+class SignIn(BaseModel):
+    filename: str
+
+
+@router.post("/sign")
+async def sign_upload(body: SignIn, user: dict = Depends(get_current_user)) -> dict:
+    filename = body.filename or "untitled"
+    if "/" in filename or "\\" in filename:
+        raise ValidationError(detail="invalid filename")
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    async with get_session() as session:
+        # same-filename re-upload for an already-EMBEDDED doc → new version of that doc
+        versioned = (
+            (
+                await session.execute(
+                    select(Document)
+                    .where(
+                        Document.org_id == user["org_id"],
+                        Document.user_id == user["user_id"],
+                        Document.original_filename == filename,
+                        Document.status == DocumentStatus.EMBEDDED,
+                    )
+                    .order_by(Document.created_at.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if versioned is not None:
+            new_version = versioned.current_version + 1
+            versioned.status = DocumentStatus.PENDING
+            versioned.pending_version = new_version
+            await session.commit()
+            presigned = presign_upload(user["org_id"], user["user_id"], versioned.id, ext)
+            return {
+                "doc_id": versioned.id,
+                "status": "pending",
+                "new_version": new_version,
+                "upload": {"url": presigned["url"], "fields": presigned["fields"]},
+            }
+
+        doc = Document(
+            user_id=user["user_id"],
+            org_id=user["org_id"],
+            original_filename=filename,
+            status=DocumentStatus.PENDING,
+            content_hash="",  # unknown until the worker fetches the object
+            current_version=1,
+        )
+        session.add(doc)
+        await session.commit()
+        presigned = presign_upload(user["org_id"], user["user_id"], doc.id, ext)
+        return {
+            "doc_id": doc.id,
+            "status": "pending",
+            "upload": {"url": presigned["url"], "fields": presigned["fields"]},
+        }
 
 
 @router.get("")
