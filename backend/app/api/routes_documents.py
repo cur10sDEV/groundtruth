@@ -98,6 +98,7 @@ async def list_documents(user: dict = Depends(get_current_user)) -> list[dict]:
                 "filename": d.original_filename,
                 "status": d.status.value,
                 "version": d.current_version,
+                "failure_reason": d.failure_reason,
             }
             for d in rows
         ]
@@ -114,6 +115,7 @@ async def get_document(doc_id: str, user: dict = Depends(get_current_user)) -> d
             "filename": doc.original_filename,
             "status": doc.status.value,
             "version": doc.current_version,
+            "failure_reason": doc.failure_reason,
         }
 
 

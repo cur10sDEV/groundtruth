@@ -3,6 +3,13 @@ import { useState } from "react";
 import { useAuth } from "@/lib/auth";
 import { API_URL } from "@/lib/api";
 
+type SignResponse = {
+  doc_id: string;
+  status: string;
+  new_version?: number;
+  upload: { url: string; fields: Record<string, string> };
+};
+
 export default function UploadButton({ onUploaded }: { onUploaded: () => void }) {
   const { auth } = useAuth();
   const [busy, setBusy] = useState(false);
@@ -12,17 +19,24 @@ export default function UploadButton({ onUploaded }: { onUploaded: () => void })
     if (!auth) return;
     setBusy(true);
     setErr("");
-    const form = new FormData();
-    form.append("file", file);
     try {
-      const res = await fetch(`${API_URL}/documents/upload`, {
+      const signRes = await fetch(`${API_URL}/documents/sign`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${auth.token}` },
-        body: form,
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${auth.token}` },
+        body: JSON.stringify({ filename: file.name }),
       });
+      if (!signRes.ok) {
+        const data = await signRes.json().catch(() => ({}));
+        setErr(String(data.error ?? "Upload request failed"));
+        return;
+      }
+      const { upload: target } = (await signRes.json()) as SignResponse;
+      const form = new FormData();
+      Object.entries(target.fields).forEach(([k, v]) => form.append(k, v));
+      form.append("file", file);
+      const res = await fetch(target.url, { method: "POST", body: form });
       if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        setErr(String(data.error ?? "Upload failed"));
+        setErr(`Upload failed (HTTP ${res.status})`);
         return;
       }
       onUploaded();

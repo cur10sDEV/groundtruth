@@ -3,9 +3,30 @@ import { useEffect, useRef, useState } from "react";
 import { useAuth } from "@/lib/auth";
 import { apiFetch } from "@/lib/api";
 
-type Doc = { id: string; filename: string; status: string; version: number };
+type Doc = {
+  id: string;
+  filename: string;
+  status: string;
+  version: number;
+  failure_reason?: string | null;
+};
 
 const TERMINAL = ["EMBEDDED", "FAILED"];
+
+function FailureReason({ reason }: { reason: string }) {
+  const dup = reason.match(/^duplicate of (.+)$/);
+  if (dup) {
+    return (
+      <>
+        {"duplicate of "}
+        <a className="underline" href={`#${dup[1]}`}>
+          {dup[1]}
+        </a>
+      </>
+    );
+  }
+  return <>{reason}</>;
+}
 
 export default function DocumentList({ refresh }: { refresh: number }) {
   const { auth } = useAuth();
@@ -57,20 +78,34 @@ export default function DocumentList({ refresh }: { refresh: number }) {
     <div className="space-y-2">
       {err && <p className="text-red-600">{err}</p>}
       <ul className="space-y-2">
-        {docs.map((d) => (
-          <li key={d.id} className="flex items-center justify-between rounded border p-2">
-            <span>{d.filename}</span>
-            <span>{d.status}</span>
-            <span>v{d.version}</span>
-            <button
-              className="rounded border border-red-300 px-2 text-sm text-red-600 disabled:opacity-50"
-              onClick={() => remove(d.id)}
-              disabled={deleting === d.id}
+        {docs
+          .filter((d) => d.status !== "DELETING")
+          .map((d) => (
+            <li
+              key={d.id}
+              id={d.id}
+              className="flex items-center justify-between rounded border p-2"
             >
-              {deleting === d.id ? "Deleting…" : "Delete"}
-            </button>
-          </li>
-        ))}
+              <span>{d.filename}</span>
+              <span className={d.status === "FAILED" ? "text-red-600" : ""}>
+                {d.status}
+                {d.status === "FAILED" && d.failure_reason && (
+                  <>
+                    {" — "}
+                    <FailureReason reason={d.failure_reason} />
+                  </>
+                )}
+              </span>
+              <span>v{d.version}</span>
+              <button
+                className="rounded border border-red-300 px-2 text-sm text-red-600 disabled:opacity-50"
+                onClick={() => remove(d.id)}
+                disabled={deleting === d.id}
+              >
+                {deleting === d.id ? "Deleting…" : "Delete"}
+              </button>
+            </li>
+          ))}
       </ul>
     </div>
   );

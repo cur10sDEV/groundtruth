@@ -40,6 +40,7 @@ def _doc(
     status: DocumentStatus = DocumentStatus.EMBEDDED,
     version: int = 1,
     content_hash: str = "0" * 64,
+    failure_reason: str | None = None,
 ) -> Document:
     return Document(
         id=doc_id,
@@ -49,6 +50,7 @@ def _doc(
         status=status,
         content_hash=content_hash,
         current_version=version,
+        failure_reason=failure_reason,
     )
 
 
@@ -218,6 +220,23 @@ async def test_list_documents_excludes_deleting(client):
     assert [d["id"] for d in resp.json()] == ["doc-embedded"]
 
 
+async def test_list_and_get_include_failure_reason(client):
+    await _seed(
+        _org("org-1"),
+        _user("user-1"),
+        _doc("doc-failed", "org-1", "user-1", DocumentStatus.FAILED, failure_reason="boom"),
+    )
+
+    token = create_access_token(sub="user-1", org_id="org-1")
+    listed = await client.get("/documents", headers=_auth(token))
+    assert listed.status_code == 200
+    assert listed.json()[0]["failure_reason"] == "boom"
+
+    got = await client.get("/documents/doc-failed", headers=_auth(token))
+    assert got.status_code == 200
+    assert got.json()["failure_reason"] == "boom"
+
+
 async def test_list_documents_requires_auth(client):
     resp = await client.get("/documents")
     assert resp.status_code == 401
@@ -239,6 +258,7 @@ async def test_get_document_returns_status_and_version(client):
         "filename": "doc-1.txt",
         "status": "PROCESSING",
         "version": 3,
+        "failure_reason": None,
     }
 
 
