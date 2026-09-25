@@ -2,7 +2,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from app.core.config import get_settings
 from app.core.qdrant_store import delete_points
@@ -34,7 +34,14 @@ async def find_stale_doc_ids(limit: int = 100) -> list[str]:
 
 
 async def reap_abandoned_pends() -> int:
-    """Sweep PENDING docs whose upload never arrived; best-effort blob cleanup.
+    """Sweep stale PENDING docs; returns the total rows handled (reaped + restored).
+
+    A stale PENDING row is either an abandoned first-upload (pending_version
+    NULL) → best-effort blob cleanup + row delete, or an abandoned versioned
+    re-upload (pending_version set; doc was serving v1) → guarded restore to
+    EMBEDDED, since the never-completed upload leaves v1 fully intact. Both
+    writes are status-guarded so a row that left PENDING between the select
+    and the write (e.g. the consumer just claimed it) is skipped, not stomped.
 
     The aware-UTC cutoff compares correctly on both backends: sqlite binds it
     as naive-UTC (matching its UTC CURRENT_TIMESTAMP) and postgres stores
@@ -54,14 +61,46 @@ async def reap_abandoned_pends() -> int:
             .scalars()
             .all()
         )
-        for d in rows:
-            try:
-                delete_prefix(d.org_id, d.user_id, d.id)
-            except Exception:
-                logger.warning("reaper blob cleanup failed", extra={"doc_id": d.id})
-            await session.delete(d)
+    handled = 0
+    for d in rows:
+        if d.pending_version is not None:
+            handled += await _restore_abandoned_version(d.id)
+        else:
+            handled += await _reap_abandoned_first_upload(d)
+    return handled
+
+
+async def _restore_abandoned_version(doc_id: str) -> int:
+    async with get_session() as session:
+        result = await session.execute(
+            update(Document)
+            .where(Document.id == doc_id, Document.status == DocumentStatus.PENDING)
+            .values(status=DocumentStatus.EMBEDDED, pending_version=None)
+        )
         await session.commit()
-        return len(rows)
+    if result.rowcount:
+        logger.info("reaper restored abandoned versioned re-upload", extra={"doc_id": doc_id})
+        return 1
+    logger.warning("reaper restore skipped; row left PENDING state", extra={"doc_id": doc_id})
+    return 0
+
+
+async def _reap_abandoned_first_upload(d: Document) -> int:
+    # claim the row (status-guarded) before sweeping blobs, so a row that just
+    # left PENDING never has its blob deleted mid-ingest
+    async with get_session() as session:
+        result = await session.execute(
+            delete(Document).where(Document.id == d.id, Document.status == DocumentStatus.PENDING)
+        )
+        await session.commit()
+    if not result.rowcount:
+        logger.warning("reaper delete skipped; row left PENDING state", extra={"doc_id": d.id})
+        return 0
+    try:
+        delete_prefix(d.org_id, d.user_id, d.id)
+    except Exception:
+        logger.warning("reaper blob cleanup failed", extra={"doc_id": d.id})
+    return 1
 
 
 async def complete_deletions() -> int:

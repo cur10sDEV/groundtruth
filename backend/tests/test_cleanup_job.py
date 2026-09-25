@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -36,6 +37,7 @@ async def _seed_doc(
     doc_id: str,
     status: DocumentStatus = DocumentStatus.PENDING,
     created_at: datetime | None = None,
+    pending_version: int | None = None,
 ) -> None:
     async with get_session() as session:
         session.add(
@@ -47,6 +49,7 @@ async def _seed_doc(
                 status=status,
                 content_hash="hash",
                 current_version=1,
+                pending_version=pending_version,
                 created_at=created_at,
             )
         )
@@ -128,6 +131,101 @@ async def test_reap_abandoned_pends_ignores_fresh_pending_and_other_statuses(db,
     assert await cleanup_module.reap_abandoned_pends() == 0
     assert await _get_doc(DOC_ID) is not None
     assert await _get_doc(DOC_B) is not None
+
+
+async def test_reap_abandoned_pends_restores_versioned_reupload(db, monkeypatch):
+    # an EMBEDDED doc flipped to PENDING for a v2 re-upload the user abandoned:
+    # v1 keeps serving, so the row must be restored, not deleted
+    await _seed_doc(
+        DOC_ID, status=DocumentStatus.PENDING, pending_version=2, created_at=_old_created_at()
+    )
+    chunk_v1 = await _seed_chunk(DOC_ID, version=1)
+
+    def must_not_delete_prefix(*args):
+        raise AssertionError("restored docs must not have blobs swept")
+
+    monkeypatch.setattr(cleanup_module, "delete_prefix", must_not_delete_prefix)
+
+    assert await cleanup_module.reap_abandoned_pends() == 1
+
+    doc = await _get_doc(DOC_ID)
+    assert doc is not None
+    assert doc.status == DocumentStatus.EMBEDDED
+    assert doc.pending_version is None
+    assert await _chunk_ids(DOC_ID) == {chunk_v1}
+
+
+async def test_reap_abandoned_pends_leaves_fresh_versioned_pending(db, monkeypatch):
+    await _seed_doc(DOC_ID, status=DocumentStatus.PENDING, pending_version=2)
+
+    def must_not_delete_prefix(*args):
+        raise AssertionError("fresh docs must not be touched")
+
+    monkeypatch.setattr(cleanup_module, "delete_prefix", must_not_delete_prefix)
+
+    assert await cleanup_module.reap_abandoned_pends() == 0
+
+    doc = await _get_doc(DOC_ID)
+    assert doc is not None
+    assert doc.status == DocumentStatus.PENDING
+    assert doc.pending_version == 2
+
+
+def _flip_to_processing(db_path, doc_id):
+    # a second actor (the consumer claiming the upload) commits a status flip
+    # between the reaper's select and its guarded statement; a sync connection
+    # is the only seam available inside the statement-construct wrapper
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE documents SET status = 'PROCESSING' WHERE id = ?", (doc_id,))
+    conn.commit()
+    conn.close()
+
+
+async def test_reap_restore_guard_skips_row_that_left_pending(db, monkeypatch, tmp_path):
+    await _seed_doc(
+        DOC_ID, status=DocumentStatus.PENDING, pending_version=2, created_at=_old_created_at()
+    )
+    real_update = cleanup_module.update
+
+    def flipping_update(*args, **kwargs):
+        _flip_to_processing(tmp_path / "test.db", DOC_ID)
+        return real_update(*args, **kwargs)
+
+    monkeypatch.setattr(cleanup_module, "update", flipping_update)
+
+    def must_not_delete_prefix(*args):
+        raise AssertionError("a row that left PENDING must not be swept")
+
+    monkeypatch.setattr(cleanup_module, "delete_prefix", must_not_delete_prefix)
+
+    assert await cleanup_module.reap_abandoned_pends() == 0
+
+    doc = await _get_doc(DOC_ID)
+    assert doc is not None
+    assert doc.status == DocumentStatus.PROCESSING  # not stomped back to EMBEDDED
+    assert doc.pending_version == 2
+
+
+async def test_reap_delete_guard_skips_row_that_left_pending(db, monkeypatch, tmp_path):
+    await _seed_doc(DOC_ID, created_at=_old_created_at())
+    real_delete = cleanup_module.delete
+
+    def flipping_delete(*args, **kwargs):
+        _flip_to_processing(tmp_path / "test.db", DOC_ID)
+        return real_delete(*args, **kwargs)
+
+    monkeypatch.setattr(cleanup_module, "delete", flipping_delete)
+
+    def must_not_delete_prefix(*args):
+        raise AssertionError("a row that left PENDING must not have its blob swept mid-ingest")
+
+    monkeypatch.setattr(cleanup_module, "delete_prefix", must_not_delete_prefix)
+
+    assert await cleanup_module.reap_abandoned_pends() == 0
+
+    doc = await _get_doc(DOC_ID)
+    assert doc is not None
+    assert doc.status == DocumentStatus.PROCESSING
 
 
 def _mock_externals(monkeypatch, failing: str | None = None) -> list[str]:
