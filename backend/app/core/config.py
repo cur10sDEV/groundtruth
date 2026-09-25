@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     rate_limit_requests: int = 30
     rate_limit_window_seconds: int = 60
 
+    # Presigned ingestion
+    upload_max_bytes: int = 50 * 1024 * 1024
+    presign_expiry_seconds: int = 900
+    reaper_pending_after_seconds: int = 3600
+
     # Tokens
     max_input_tokens: int = 8000
     max_output_tokens: int = 2048

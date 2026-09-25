@@ -9,6 +9,9 @@ CACHE_HITS = Counter("rag_cache_hits_total", "Cache hits")
 CACHE_MISSES = Counter("rag_cache_misses_total", "Cache misses")
 INGESTION_PROCESSED = Counter("rag_ingestion_processed_total", "Docs ingested")
 INGESTION_FAILED = Counter("rag_ingestion_failed_total", "Docs failed")
+EVENTS_DROPPED = Counter(
+    "rag_events_dropped_total", "Ingestion events dropped by the translator", ["reason"]
+)
 
 
 def record_request(duration_seconds: float, status: str) -> None:

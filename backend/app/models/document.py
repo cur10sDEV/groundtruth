@@ -11,6 +11,7 @@ class DocumentStatus(StrEnum):
     PROCESSING = "PROCESSING"
     EMBEDDED = "EMBEDDED"
     FAILED = "FAILED"
+    DELETING = "DELETING"
 
 
 class Document(UUIDPkMixin, TimestampMixin, Base):
@@ -22,3 +23,4 @@ class Document(UUIDPkMixin, TimestampMixin, Base):
     content_hash: Mapped[str] = mapped_column(String(64), index=True)
     current_version: Mapped[int] = mapped_column(Integer, default=1)
     pending_version: Mapped[int | None] = mapped_column(Integer)
+    failure_reason: Mapped[str | None] = mapped_column(String(1024))
