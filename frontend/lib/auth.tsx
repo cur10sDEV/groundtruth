@@ -44,11 +44,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.removeItem("rag-auth");
   };
 
-  return (
-    <AuthContext.Provider value={{ auth, login, signup, logout }}>
-      {children}
-    </AuthContext.Provider>
-  );
+  return <AuthContext value={{ auth, login, signup, logout }}>{children}</AuthContext>;
 }
 
 export const useAuth = () => useContext(AuthContext);

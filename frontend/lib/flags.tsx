@@ -77,7 +77,7 @@ export function FlagsmithProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo(() => flags, [flags]);
 
-  return <FlagsContext.Provider value={value}>{children}</FlagsContext.Provider>;
+  return <FlagsContext value={value}>{children}</FlagsContext>;
 }
 
 export function useFlags(): Flags {
