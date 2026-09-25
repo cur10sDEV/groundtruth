@@ -509,6 +509,12 @@ async def test_find_stale_doc_ids_returns_docs_with_stale_chunks(db):
 async def test_cleanup_job_loop_cleans_stale_docs(monkeypatch):
     cleaned = []
 
+    async def fake_complete_deletions():
+        return 0
+
+    async def fake_reap_abandoned_pends():
+        return 0
+
     async def fake_find_stale_doc_ids(limit=100):
         return [DOC_B]
 
@@ -518,6 +524,8 @@ async def test_cleanup_job_loop_cleans_stale_docs(monkeypatch):
     async def stop_loop(_seconds):
         raise asyncio.CancelledError
 
+    monkeypatch.setattr(cleanup_module, "complete_deletions", fake_complete_deletions)
+    monkeypatch.setattr(cleanup_module, "reap_abandoned_pends", fake_reap_abandoned_pends)
     monkeypatch.setattr(cleanup_module, "find_stale_doc_ids", fake_find_stale_doc_ids)
     monkeypatch.setattr(cleanup_module, "cleanup_stale", fake_cleanup_stale)
     monkeypatch.setattr(cleanup_module.asyncio, "sleep", stop_loop)
@@ -532,6 +540,12 @@ async def test_cleanup_job_loop_survives_iteration_failure(monkeypatch):
     attempts = []
     sleeps = []
 
+    async def fake_complete_deletions():
+        return 0
+
+    async def fake_reap_abandoned_pends():
+        return 0
+
     async def fake_find_stale_doc_ids(limit=100):
         return [DOC_B, DOC_A]
 
@@ -543,6 +557,8 @@ async def test_cleanup_job_loop_survives_iteration_failure(monkeypatch):
         sleeps.append(seconds)
         raise asyncio.CancelledError
 
+    monkeypatch.setattr(cleanup_module, "complete_deletions", fake_complete_deletions)
+    monkeypatch.setattr(cleanup_module, "reap_abandoned_pends", fake_reap_abandoned_pends)
     monkeypatch.setattr(cleanup_module, "find_stale_doc_ids", fake_find_stale_doc_ids)
     monkeypatch.setattr(cleanup_module, "cleanup_stale", failing_cleanup_stale)
     monkeypatch.setattr(cleanup_module.asyncio, "sleep", stop_loop)
