@@ -162,7 +162,7 @@ async def delete_document(doc_id: str, user: dict = Depends(get_current_user)) -
         logger.warning("delete: cache invalidation failed", extra={"doc_id": doc_id})
         done = False
     try:
-        delete_prefix(user["org_id"], user["user_id"], doc_id)
+        delete_prefix(doc.org_id, doc.user_id, doc_id)
     except Exception:
         logger.warning("delete: blob cleanup failed", extra={"doc_id": doc_id})
         done = False

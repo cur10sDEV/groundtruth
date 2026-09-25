@@ -520,6 +520,75 @@ async def test_delete_partial_failure_leaves_tombstone(client, monkeypatch):
         assert rows == []
 
 
+async def test_delete_cascade_uses_owner_prefix_not_caller(client, monkeypatch):
+    await _seed(
+        _org("org-1"),
+        _user("user-a"),
+        _user("user-b"),
+        _doc("doc-b", "org-1", "user-b"),
+        _chunk("chunk-1", "doc-b", "org-1", "user-b", version=1, start_offset=0, end_offset=5),
+    )
+    s3_deletes: list = []
+
+    def fake_delete_points(point_ids, payload_filter=None):
+        pass
+
+    async def fake_invalidate(org_id, doc_id):
+        pass
+
+    def fake_delete_prefix(org_id, user_id, doc_id):
+        s3_deletes.append((org_id, user_id, doc_id))
+        return 1
+
+    monkeypatch.setattr("app.api.routes_documents.delete_points", fake_delete_points)
+    monkeypatch.setattr("app.api.routes_documents.invalidate_for_doc", fake_invalidate)
+    monkeypatch.setattr("app.api.routes_documents.delete_prefix", fake_delete_prefix)
+
+    token = create_access_token(sub="user-a", org_id="org-1")
+    resp = await client.delete("/documents/doc-b", headers=_auth(token))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"doc_id": "doc-b", "status": "deleted"}
+    assert s3_deletes == [("org-1", "user-b", "doc-b")]  # owner's prefix, not caller's
+    async with db_module.get_session() as session:
+        assert await session.get(Document, "doc-b") is None
+
+
+async def test_delete_already_deleting_doc_is_idempotent(client, monkeypatch):
+    await _seed(
+        _org("org-1"),
+        _user("user-1"),
+        _doc("doc-1", "org-1", "user-1", DocumentStatus.DELETING),
+        _chunk("chunk-1", "doc-1", "org-1", "user-1", version=1, start_offset=0, end_offset=5),
+    )
+    s3_deletes: list = []
+
+    def fake_delete_points(point_ids, payload_filter=None):
+        pass
+
+    async def fake_invalidate(org_id, doc_id):
+        pass
+
+    def fake_delete_prefix(org_id, user_id, doc_id):
+        s3_deletes.append((org_id, user_id, doc_id))
+        return 1
+
+    monkeypatch.setattr("app.api.routes_documents.delete_points", fake_delete_points)
+    monkeypatch.setattr("app.api.routes_documents.invalidate_for_doc", fake_invalidate)
+    monkeypatch.setattr("app.api.routes_documents.delete_prefix", fake_delete_prefix)
+
+    token = create_access_token(sub="user-1", org_id="org-1")
+    resp = await client.delete("/documents/doc-1", headers=_auth(token))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"doc_id": "doc-1", "status": "deleted"}
+    assert s3_deletes == [("org-1", "user-1", "doc-1")]
+    async with db_module.get_session() as session:
+        assert await session.get(Document, "doc-1") is None
+        rows = (await session.execute(select(Chunk).where(Chunk.doc_id == "doc-1"))).scalars().all()
+        assert rows == []
+
+
 async def test_delete_document_other_org_hidden_and_untouched(client, monkeypatch):
     await _seed(_org("org-2"), _user("user-2"), _doc("doc-2", "org-2", "user-2"))
 
