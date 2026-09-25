@@ -69,3 +69,31 @@ def delete_object(s3_key: str) -> None:
         session.delete_object(Bucket=s.s3_bucket, Key=s3_key)
     except ClientError as exc:
         raise StorageError(detail=f"s3 delete failed: {exc}") from exc
+
+
+def presign_upload(org_id: str, user_id: str, doc_id: str, ext: str) -> dict:
+    s = get_settings()
+    client = _client()
+    key = build_key(org_id, user_id, doc_id, f"{uuid4()}.{ext}")
+    post = client.generate_presigned_post(
+        Bucket=s.s3_bucket,
+        Key=key,
+        Conditions=[["content-length-range", 0, s.upload_max_bytes]],
+        ExpiresIn=s.presign_expiry_seconds,
+    )
+    return {"url": post["url"], "fields": post["fields"], "key": key}
+
+
+def delete_prefix(org_id: str, user_id: str, doc_id: str) -> int:
+    s = get_settings()
+    client = _client()
+    prefix = f"documents/{org_id}/{user_id}/{doc_id}/"
+    deleted = 0
+    keys: list[str] = []
+    resp = client.list_objects_v2(Bucket=s.s3_bucket, Prefix=prefix)
+    keys = [o["Key"] for o in resp.get("Contents", [])]
+    for i in range(0, len(keys), 1000):
+        batch = keys[i : i + 1000]
+        client.delete_objects(Bucket=s.s3_bucket, Delete={"Objects": [{"Key": k} for k in batch]})
+        deleted += len(batch)
+    return deleted
