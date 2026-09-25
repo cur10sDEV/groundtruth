@@ -2,11 +2,12 @@ import hashlib
 import logging
 
 from fastapi import APIRouter, Depends, File, UploadFile
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 
 from app.auth.dependencies import get_current_user
 from app.core.errors import ValidationError
-from app.core.s3 import put_object
+from app.core.qdrant_store import delete_points
+from app.core.s3 import delete_prefix, put_object
 from app.db import get_session
 from app.ingestion.publisher import publish_ingestion
 from app.models.chunk import Chunk
@@ -101,6 +102,7 @@ async def list_documents(user: dict = Depends(get_current_user)) -> list[dict]:
                     select(Document).where(
                         Document.org_id == user["org_id"],
                         Document.user_id == user["user_id"],
+                        Document.status != DocumentStatus.DELETING,
                     )
                 )
             )
@@ -134,15 +136,43 @@ async def get_document(doc_id: str, user: dict = Depends(get_current_user)) -> d
 
 @router.delete("/{doc_id}")
 async def delete_document(doc_id: str, user: dict = Depends(get_current_user)) -> dict:
-    from app.ingestion.cancel import cancel_document
-
     async with get_session() as session:
         doc = await session.get(Document, doc_id)
         if doc is None or doc.org_id != user["org_id"]:
             raise ValidationError(detail="document not found")
-    await cancel_document(doc_id)
-    await invalidate_for_doc(user["org_id"], doc_id)
-    return {"doc_id": doc_id, "status": "cancelled"}
+        await session.execute(
+            update(Document)
+            .where(Document.id == doc_id, Document.org_id == user["org_id"])
+            .values(status=DocumentStatus.DELETING, failure_reason=None)
+        )
+        await session.execute(delete(Chunk).where(Chunk.doc_id == doc_id))
+        await session.commit()
+    done = True
+    try:
+        delete_points(
+            [],
+            {"must": [{"key": "doc_id", "match": {"value": doc_id}}]},
+        )
+    except Exception:
+        logger.warning("delete: qdrant cleanup failed", extra={"doc_id": doc_id})
+        done = False
+    try:
+        await invalidate_for_doc(user["org_id"], doc_id)
+    except Exception:
+        logger.warning("delete: cache invalidation failed", extra={"doc_id": doc_id})
+        done = False
+    try:
+        delete_prefix(user["org_id"], user["user_id"], doc_id)
+    except Exception:
+        logger.warning("delete: blob cleanup failed", extra={"doc_id": doc_id})
+        done = False
+    if done:
+        async with get_session() as session:
+            d = await session.get(Document, doc_id)
+            if d is not None:
+                await session.delete(d)
+                await session.commit()
+    return {"doc_id": doc_id, "status": "deleted" if done else "deleting"}
 
 
 @router.get("/{doc_id}/chunks")

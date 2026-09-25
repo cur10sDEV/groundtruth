@@ -1,6 +1,6 @@
 import logging
 
-from sqlalchemy import delete
+from sqlalchemy import delete, update
 
 from app.core.qdrant_store import delete_points
 from app.db import get_session
@@ -16,9 +16,22 @@ async def cancel_document(doc_id: str) -> None:
         doc = await session.get(Document, doc_id)
         if doc is None:
             return
-        doc.status = DocumentStatus.FAILED
         pending = doc.pending_version
-        doc.pending_version = None
+        result = await session.execute(
+            update(Document)
+            .where(
+                Document.id == doc_id,
+                Document.status.in_((DocumentStatus.PENDING, DocumentStatus.PROCESSING)),
+            )
+            .values(status=DocumentStatus.FAILED, pending_version=None)
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount == 0:
+            logger.info(
+                "cancel lost the race; concurrent state change won",
+                extra={"doc_id": doc_id},
+            )
+            return
         if pending is not None:
             delete_points(
                 [],
