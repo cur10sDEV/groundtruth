@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 import uuid
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import IngestionError
@@ -61,6 +61,50 @@ async def _reset_version(doc_id: str, version: int, session: AsyncSession) -> No
     _cleanup_partial_qdrant(doc_id, version)
 
 
+async def _finalize(doc_id: str, content_hash: str, new_version: int | None = None) -> None:
+    """Guarded completion: flip to EMBEDDED (and roll the version) only while PROCESSING."""
+    values: dict[str, object] = {
+        "status": DocumentStatus.EMBEDDED,
+        "pending_version": None,
+        "content_hash": content_hash,
+    }
+    if new_version is not None:
+        values["current_version"] = new_version
+    async with get_session() as session:
+        result = await session.execute(
+            update(Document)
+            .where(Document.id == doc_id, Document.status == DocumentStatus.PROCESSING)
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        await session.commit()
+    if result.rowcount == 0:
+        raise IngestionError(detail=f"document finalization lost the race: {doc_id}")
+
+
+async def _mark_failed(doc_id: str, reason: str | None = None) -> bool:
+    """Guarded failure transition; a lost race (e.g. to DELETING) is fine and not an error."""
+    async with get_session() as session:
+        result = await session.execute(
+            update(Document)
+            .where(Document.id == doc_id, Document.status == DocumentStatus.PROCESSING)
+            .values(
+                status=DocumentStatus.FAILED,
+                pending_version=None,
+                failure_reason=reason,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await session.commit()
+    if result.rowcount == 0:
+        logger.info(
+            "failure mark lost the race; concurrent state change won",
+            extra={"doc_id": doc_id},
+        )
+        return False
+    return True
+
+
 async def _embed_and_store(doc: Document, chunks: list[dict], upserted: list[str]) -> None:
     for i in range(0, len(chunks), EMBED_BATCH):
         batch = chunks[i : i + EMBED_BATCH]
@@ -100,17 +144,30 @@ async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
             raise IngestionError(detail=f"document not found: {doc_id}")
         chunk_version = doc.current_version if version is None else version
         dedup = version is None
-        doc.status = DocumentStatus.PROCESSING
-        doc.pending_version = chunk_version
+        claimed = await session.execute(
+            update(Document)
+            .where(
+                Document.id == doc_id,
+                Document.status.in_(
+                    (
+                        DocumentStatus.PENDING,
+                        DocumentStatus.PROCESSING,
+                        DocumentStatus.FAILED,
+                    )
+                ),
+            )
+            .values(status=DocumentStatus.PROCESSING, pending_version=chunk_version)
+            .execution_options(synchronize_session=False)
+        )
         await session.commit()
+        if claimed.rowcount == 0:
+            raise IngestionError(detail=f"document not processing-claimable: {doc_id}")
         upserted: list[str] = []
         try:
             raw = get_object(s3_key)
             content_hash = _hash(raw)
             if dedup and content_hash == doc.content_hash:
-                doc.status = DocumentStatus.EMBEDDED
-                doc.pending_version = None
-                await session.commit()
+                await _finalize(doc_id, content_hash=doc.content_hash)
                 INGESTION_PROCESSED.inc()
                 return 0
 
@@ -165,27 +222,23 @@ async def _ingest(doc_id: str, s3_key: str, version: int | None = None) -> int:
                 )
                 for c in chunks
             )
-            doc.content_hash = content_hash
-            doc.status = DocumentStatus.EMBEDDED
-            doc.pending_version = None
             await session.commit()
+            await _finalize(doc_id, content_hash, new_version=version)
             INGESTION_PROCESSED.inc()
             return len(chunks)
         except asyncio.CancelledError:
-            INGESTION_FAILED.inc()
             if upserted:
                 _cleanup_partial_qdrant(doc_id, chunk_version)
-            doc.status = DocumentStatus.FAILED
-            doc.pending_version = None
-            await session.commit()
+            await session.rollback()
+            if await _mark_failed(doc_id):
+                INGESTION_FAILED.inc()
             raise
         except Exception:
-            INGESTION_FAILED.inc()
             if upserted:
                 _cleanup_partial_qdrant(doc_id, chunk_version)
-            doc.status = DocumentStatus.FAILED
-            doc.pending_version = None
-            await session.commit()
+            await session.rollback()
+            if await _mark_failed(doc_id):
+                INGESTION_FAILED.inc()
             raise
 
 
@@ -195,19 +248,17 @@ async def ingest_document(doc_id: str, s3_key: str) -> int:
 
 async def ingest_versioned(doc_id: str, s3_key: str, new_version: int) -> int:
     count = await _ingest(doc_id, s3_key, version=new_version)
-    async with get_session() as session:
-        doc = await session.get(Document, doc_id)
-        if doc is None:
-            raise IngestionError(detail=f"document not found: {doc_id}")
-        doc.current_version = new_version
-        await session.commit()
-    await _invalidate_cache(doc_id, doc.org_id)
+    await _invalidate_cache(doc_id)
     return count
 
 
-async def _invalidate_cache(doc_id: str, org_id: str) -> None:
+async def _invalidate_cache(doc_id: str) -> None:
     try:
-        await invalidate_for_doc(org_id, doc_id)
+        async with get_session() as session:
+            doc = await session.get(Document, doc_id)
+            if doc is None:
+                return
+            await invalidate_for_doc(doc.org_id, doc_id)
     except Exception:
         logger.warning("cache invalidation failed", extra={"doc_id": doc_id})
 

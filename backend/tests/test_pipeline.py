@@ -509,11 +509,10 @@ async def test_versioned_flip_keeps_v1_serving_until_flip(
     from app.rag.retrieval.orchestrator import resolve_text_for_chunk_ids
 
     fake_s3[S3_KEY] = b"Version two content with fresh words."
+    # PENDING is the real state of a versioned re-ingest: the upload route flips
+    # the doc EMBEDDED → PENDING when publishing, and only the guarded finalize
+    # (which also rolls current_version) may set it back to EMBEDDED.
     await _seed_doc(current_version=1)
-    async with get_session() as session:
-        doc = await session.get(Document, DOC_ID)
-        doc.status = DocumentStatus.EMBEDDED
-        await session.commit()
     v1_id = await _seed_chunk(version=1, text="v1 body")
 
     # pre-flip: v1 is the current version and serves
@@ -611,22 +610,18 @@ async def test_ingest_failure_increments_failed_total(db, fake_s3, fake_qdrant, 
 
 
 @contextmanager
-def _crash_on_second_get_session():
-    """Simulate a hard crash after commit A by failing the flip's session."""
-    real_get_session = pipeline.get_session
-    calls = {"n": 0}
+def _crash_on_finalize():
+    """Simulate a hard crash after the chunk-rows commit, before the guarded finalize."""
+    real_finalize = pipeline._finalize
 
-    def crashing_get_session():
-        calls["n"] += 1
-        if calls["n"] >= 2:
-            raise RuntimeError("crash between chunk commit and version flip")
-        return real_get_session()
+    async def crashing_finalize(doc_id, content_hash, new_version=None):
+        raise KeyboardInterrupt
 
-    pipeline.get_session = crashing_get_session
+    pipeline._finalize = crashing_finalize
     try:
         yield
     finally:
-        pipeline.get_session = real_get_session
+        pipeline._finalize = real_finalize
 
 
 def test_chunk_id_derivation_is_deterministic():
@@ -646,7 +641,7 @@ async def test_versioned_crash_window_redelivery_converges(
     fake_s3[S3_KEY] = b"Version two content with fresh words."
     await _seed_doc(current_version=1)
 
-    with _crash_on_second_get_session(), pytest.raises(RuntimeError):
+    with _crash_on_finalize(), pytest.raises(KeyboardInterrupt):
         await ingest_versioned(DOC_ID, S3_KEY, 2)
 
     # crash window state: v2 chunks/points committed but the flip never happened
@@ -683,7 +678,7 @@ async def test_versioned_retry_with_fewer_chunks_leaves_no_leftovers(
     fake_s3[S3_KEY] = body
     await _seed_doc(current_version=1)
 
-    with _crash_on_second_get_session(), pytest.raises(RuntimeError):
+    with _crash_on_finalize(), pytest.raises(KeyboardInterrupt):
         await ingest_versioned(DOC_ID, S3_KEY, 2)
 
     assert len(await _chunks_for()) == 3
@@ -771,3 +766,53 @@ async def test_plain_path_crash_retry_converges(
     assert set(fake_qdrant["points"]) == expected_ids
     assert orphan_ids == expected_ids
     assert fake_qdrant["deletes"] == [([], _doc_version_filter(1)), ([], _doc_version_filter(1))]
+
+
+# --- Guarded status transitions: deletion must be un-raceable ---
+
+
+async def test_delete_during_ingest_cannot_be_flipped(db):
+    # simulate: a DELETING row while _ingest runs
+    await _seed_doc()
+    async with get_session() as session:
+        doc = await session.get(Document, DOC_ID)
+        doc.status = DocumentStatus.DELETING
+        await session.commit()
+
+    # claim must fail: DELETING row cannot be re-claimed
+    with pytest.raises(IngestionError):
+        await pipeline._ingest(DOC_ID, S3_KEY)
+
+
+async def test_finalize_loses_race_to_deleting(db):
+    # doc PROCESSING, chunks committed, then deletion flips status mid-run
+    await _seed_doc()
+    async with get_session() as session:
+        doc = await session.get(Document, DOC_ID)
+        doc.status = DocumentStatus.PROCESSING
+        doc.pending_version = 1
+        await session.commit()
+    async with get_session() as session:
+        doc = await session.get(Document, DOC_ID)
+        doc.status = DocumentStatus.DELETING
+        await session.commit()
+
+    with pytest.raises(IngestionError):
+        await pipeline._finalize(DOC_ID, "hash123")
+
+    doc = await _get_doc()
+    assert doc.status == DocumentStatus.DELETING  # not stomped
+
+
+async def test_mark_failed_does_not_stomp_deleting(db):
+    await _seed_doc()
+    async with get_session() as session:
+        doc = await session.get(Document, DOC_ID)
+        doc.status = DocumentStatus.DELETING
+        await session.commit()
+
+    await pipeline._mark_failed(DOC_ID, reason="boom")
+
+    doc = await _get_doc()
+    assert doc.status == DocumentStatus.DELETING
+    assert doc.failure_reason is None
