@@ -22,7 +22,7 @@ cp .env.example .env            # then edit: set LLM_API_KEY_PRIMARY (see below)
 # 3. ingestion worker (separate shell, same dir)
 ./.venv/bin/python -m app.ingestion.worker
 
-# 4. frontend (node 18+)
+# 4. frontend (node 20.9+)
 cd ../frontend
 cp .env.example .env.local
 npm install
