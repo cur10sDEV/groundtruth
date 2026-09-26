@@ -58,7 +58,7 @@ export default function Message({
       <div
         className={
           "inline-block max-w-[80%] whitespace-pre-wrap rounded p-3 " +
-          (role === "user" ? "bg-blue-100" : "bg-white border")
+          (role === "user" ? "bg-blue-100" : "bg-white border border-slate-300")
         }
       >
         {parts.map((part, i) => {
@@ -89,7 +89,7 @@ export default function Message({
       </div>
       {err && <div className="mt-1 max-w-[80%] text-xs text-red-600">{err}</div>}
       {open && cites && (
-        <div className="mt-1 max-w-[80%] space-y-2 rounded border bg-slate-50 p-2 text-left text-xs text-slate-600">
+        <div className="mt-1 max-w-[80%] space-y-2 rounded border border-slate-300 bg-slate-50 p-2 text-left text-xs text-slate-600">
           {cites.length === 0 && <div>No citations stored for this answer.</div>}
           {cites.map((c, i) => (
             <div key={c.chunk_id}>

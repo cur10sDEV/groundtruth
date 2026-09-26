@@ -91,7 +91,7 @@ export default function DocumentList({ refresh }: { refresh: number }) {
             <li
               key={d.id}
               id={d.id}
-              className="flex items-center justify-between rounded border p-2"
+              className="flex items-center justify-between rounded border border-slate-300 p-2"
             >
               <span>{d.filename}</span>
               <span className={d.status === "FAILED" ? "text-red-600" : ""}>

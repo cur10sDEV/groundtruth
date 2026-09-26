@@ -96,7 +96,7 @@ export default function ChatStream() {
       ) : null}
       <div className="flex gap-2 pt-4">
         <input
-          className="flex-1 rounded border p-2"
+          className="flex-1 rounded border border-slate-300 p-2"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && send()}
