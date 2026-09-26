@@ -90,6 +90,13 @@ row, or a version bump on an existing same-name document); the browser then
 FormData-POSTs the file **directly to MinIO** — the backend never proxies bytes.
 The 50 MB cap (`UPLOAD_MAX_BYTES`) is enforced by MinIO's POST policy itself.
 
+Document endpoints are strictly owner-scoped: listing, signing, chunk access,
+and deletion all match the document's `user_id` against the caller's, and a
+foreign document id returns the exact same `422 document not found` as a
+missing one — so a document's existence never leaks to anyone else in the
+org. There is deliberately no admin escape hatch. Retrieval, the semantic
+cache, and citations remain org-scoped.
+
 Trigger: MinIO's `notify_amqp` target publishes `s3:ObjectCreated:*` events under
 `documents/` to the `minio.events` exchange. The worker's translator validates
 each event (event type, bucket, key shape, a matching PENDING/PROCESSING row,
