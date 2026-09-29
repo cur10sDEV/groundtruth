@@ -37,3 +37,7 @@ logs/
 data/
 *.sqlite3
 eval/output/
+
+# development
+docs/
+user-specs
